@@ -2,6 +2,8 @@
 
 A comprehensive learning resource for mastering GitHub Actions, from fundamental concepts to production-ready CI/CD pipelines. This guide covers everything you need to build automated workflows for modern software development.
 
+🔗 **[Full Course Website](https://courses.devopsdirective.com/github-actions-beginner-to-pro)** | 📦 **[Course Repository](https://github.com/islamMaruf/devops-directive-github-actions-course)**
+
 ## 📚 Course Overview
 
 This learning path combines theory and hands-on practice to take you from beginner to proficient GitHub Actions practitioner. You'll learn to automate testing, building, deployment, and operational tasks using GitHub's native CI/CD platform.
@@ -118,11 +120,12 @@ Complete your CI/CD pipeline with GitOps manifest updates, release automation, s
 
 ## 🚀 Getting Started
 
-1. **Fork the repository** to your GitHub account
-2. **Clone with submodules**: `git clone --recurse-submodules <your-fork-url>`
-3. **Set up development environment** following Chapter 4
-4. **Start with Chapter 1** and progress sequentially
-5. **Practice with examples** in each chapter
+1. **Visit the [course website](https://courses.devopsdirective.com/github-actions-beginner-to-pro)** for video content
+2. **Fork the [course repository](https://github.com/islamMaruf/devops-directive-github-actions-course)** to your GitHub account
+3. **Clone with submodules**: `git clone --recurse-submodules <your-fork-url>`
+4. **Set up development environment** following Chapter 4
+5. **Start with Chapter 1** and progress sequentially
+6. **Practice with examples** in each chapter
 
 ## 🛠️ Prerequisites
 
@@ -158,9 +161,10 @@ This course follows a **theory-then-practice** approach:
 
 ## 🔗 Additional Resources
 
-- [GitHub Actions Documentation](https://docs.github.com/en/actions)
-- [GitHub Actions Marketplace](https://github.com/marketplace?type=actions)
-- [Course Repository Issues](https://github.com/sidpalas/devops-directive-github-actions-course/issues)
+- [Full Course Website](https://courses.devopsdirective.com/github-actions-beginner-to-pro) - Complete video and written content
+- [Course GitHub Repository](https://github.com/islamMaruf/devops-directive-github-actions-course) - All code examples and workflows
+- [GitHub Actions Documentation](https://docs.github.com/en/actions) - Official documentation
+- [GitHub Actions Marketplace](https://github.com/marketplace?type=actions) - Pre-built actions
 
 ## 📝 Notes
 
