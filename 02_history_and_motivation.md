@@ -1,694 +1,152 @@
-# Chapter 2: History and Motivation - The Evolution of Continuous Integration
+# Chapter 2: Why CI/CD Exists
 
-## Overview
+> **Level:** beginner · **Time:** 40 minutes · **Prerequisites:** [Chapter 1](01_introduction.md)
+> **Next:** [Chapter 3: Why GitHub Actions?](03_why_github_actions.md)
 
-To truly understand GitHub Actions and appreciate its design decisions, we must first understand the historical context from which it emerged. This chapter traces the evolution of software development practices from the earliest days of computing through the modern era of continuous integration. By understanding this journey, you'll gain insight into why automation became critical, how CI/CD tools evolved, and what problems GitHub Actions specifically solves.
+## Learning objectives
 
-## The Journey of Software Delivery: From Punch Cards to Multiple Daily Deployments
+After this chapter you can:
 
-The way software is built, tested, and delivered has undergone a dramatic transformation over the past several decades. Let's walk through this evolution to understand how we arrived at modern CI/CD practices.
+- Explain why shipping software faster forced teams to automate testing and deployment.
+- Place the major CI tools in time and say what each one added.
+- Name the four kinds of work CI/CD systems automate.
+- Contrast push-based deployment with GitOps (pull-based) deployment.
 
-### Era 1: Physical Punch Cards (Pre-1970s)
+## 1. Problem statement
 
-**The Process**:
-At the very dawn of computing, programs weren't typed on keyboards or written in text files. Instead, they were **encoded onto physical punch cards**—pieces of stiff paper with holes punched in specific patterns. Each hole (or absence of a hole) represented binary data that machines could read.
+Understanding *why* a tool looks the way it does makes its rules easier to remember. GitHub Actions did not appear from nowhere: it combines ideas from twenty years of build servers. And the four kinds of work it automates (check, build, deploy, maintain) are the same in every CI/CD system, so this vocabulary transfers to any tool you meet later.
 
-**How it worked**:
-1. A programmer would write out their program logic on paper
-2. They would translate this logic into punch card format
-3. Physical holes would be punched into cards using a keypunch machine
-4. These cards would be physically carried to a mainframe computer
-5. The card deck would be fed into the machine
-6. The machine would read the holes and execute the program
-7. Results would be printed on paper
+## 2. Core explanation
 
-**Who used the software**: Primarily, the people writing the software were also the ones consuming it. These were researchers, scientists, and specialized operators working on massive mainframe systems. There was no concept of "end users" in the modern sense—no personal computers existed.
+### How delivery speed created the need for automation
 
-**Deployment frequency**: Updates were **extremely infrequent**, measured in weeks or months. Why?
-- Creating punch cards was labor-intensive and error-prone
-- A single misplaced hole could break the entire program
-- Computer time was expensive and scheduled in advance
-- Debugging required creating new cards and waiting for another computer time slot
+| Era | How software reached users | Typical release rhythm | Consequence for testing |
+|---|---|---|---|
+| Early mainframes | Programs run by the people who wrote them (punch cards, batch jobs). | Weeks to months, limited by access to machines. | Debugging meant waiting for the next machine slot. |
+| Boxed software | Floppies, CDs, DVDs, shipped by mail. | Months to years. A bug fix meant manufacturing new media. | Mistakes were expensive, so testing was careful but largely manual. |
+| Web and downloads | Servers updated centrally; downloads over the internet. | Weekly or faster. | Manual testing became the bottleneck. Automated tests became essential. |
+| Cloud era | Continuous delivery to servers and app stores. | Many times per day for strong teams. | Automation is mandatory: people cannot keep pace with that volume of changes. |
 
-**Key insight**: In this era, automation wasn't even a consideration. The bottleneck was physical—the time to encode programs and access to scarce computing resources.
+The pattern: **every time the cost of releasing dropped, the amount of checking per release had to be automated**, otherwise quality collapsed or releases stalled.
 
-### Era 2: Physical Media Distribution (1970s-1990s)
+### Before CI: "integration hell"
 
-**The Process**:
-As personal computing emerged, software began to be packaged and distributed to end users on physical media—first floppy disks, then compact discs (CDs), and eventually DVDs.
+Developers worked on long-lived branches for weeks, then tried to merge everything at once. Conflicts were large, bugs surfaced long after they were introduced, and "it works on my machine" was a daily problem because there was no shared, repeatable build.
 
-**How it worked**:
-1. Developers would write and test software on their machines
-2. The software would be compiled into executable files
-3. These files would be written to physical media (floppy disks, CDs, DVDs)
-4. Media would be packaged with printed manuals
-5. Physical packages would be shipped via postal mail to retailers or directly to customers
-6. End users would receive the package and install from the disk
+**Continuous Integration** is the opposite habit: integrate small changes often, and verify each one automatically.
 
-**Who used the software**: Now we have true end users—people buying software products like Microsoft Office, Adobe Photoshop, or video games to run on their home computers.
+### A short timeline of CI tools
 
-**Deployment frequency**: Updates remained **slow**, typically measured in **months or even years**. Why?
-- **Physical manufacturing**: Creating thousands of CDs or floppy disks required manufacturing time
-- **Distribution logistics**: Shipping physical media took days or weeks
-- **High cost per update**: Each update required manufacturing new media, printing new materials, and shipping again
-- **No rollback capability**: Once users installed software, fixing bugs required shipping entirely new media
+| Year (approx.) | Tool | What it added |
+|---|---|---|
+| 1997 | Tinderbox (Netscape/Mozilla) | Automated builds on multiple platforms with a web page showing which commit broke the build. |
+| 2001 | CruiseControl (ThoughtWorks) | Build + test as one automated loop for Java projects; plugins; failure notifications. |
+| 2005 | Hudson, later forked as Jenkins | A friendly web UI, a huge plugin ecosystem, distributed builds. Flexible, but you run and patch the server yourself. |
+| 2006–2007 | Bamboo (Atlassian), TeamCity (JetBrains) | CI tied closely to the issue tracker, code host and IDE. |
+| 2011 | Travis CI, CircleCI | CI as a hosted service. Configuration lives in the repository (`.travis.yml`, `config.yml`); free for open source. |
+| 2015+ | GitLab CI/CD; cloud-provider build services (AWS, Google Cloud, Azure) | CI built into the code platform or the cloud platform. |
+| 2018–2019 | GitHub Actions | Announced in 2018 and generally available in late 2019. Automation built into the world's largest code host, with a public marketplace of reusable actions. |
 
-**Example**: If Microsoft Windows 95 had a critical bug after release, Microsoft would need to:
-- Fix the bug in code
-- Manufacture millions of new CDs
-- Ship updates to every customer (or wait until the next major version)
+The trend: from *a server you operate* to *a service you configure with a file in your repository*.
 
-This made updates extremely expensive, so companies would bundle many fixes together into large "service packs" released infrequently.
+### The four kinds of work CI/CD automates
 
-**Key insight**: The constraint shifted from computing resources to **physical distribution logistics**. Testing became more important because mistakes were expensive to fix, but testing was still largely manual.
+1. **Validation.** Linting, unit/integration/end-to-end tests, type checks, static analysis, dependency and security scans. Goal: catch defects before they are merged.
+2. **Building artifacts.** Compile code, bundle dependencies, build container images, tag them with a version. Goal: a reproducible, versioned thing that can be deployed.
+3. **Deployment.** Get the artifact running somewhere. (See below.)
+4. **Repository automation.** Releases and changelogs, stale-issue cleanup, dependency-update pull requests, issue labeling.
 
-### Era 3: Internet-Based Distribution (2000s)
+### Two deployment models
 
-**The Process**:
-The dot-com boom and widespread internet adoption revolutionized software delivery. Applications could now be delivered as **websites** or **downloadable programs** over the internet.
+| | Push-based | GitOps (pull-based) |
+|---|---|---|
+| Who acts | The CI system authenticates to the target and applies the change. | CI only updates a Git repository that describes the desired state. An agent inside the target (for example Argo CD or Flux for Kubernetes) notices the change and applies it. |
+| Credentials | CI holds credentials that can change production. | Production credentials stay inside production; CI needs only Git access. |
+| Audit and rollback | Depends on your scripts and logs. | Every change is a Git commit; rollback is a revert. |
+| Cost | Simple to set up. | An extra component to run and understand. |
 
-**How it worked**:
-1. Developers write code and commit to version control
-2. Code is tested (increasingly with automated tests)
-3. Code is compiled/bundled and deployed to web servers
-4. Users access the application through web browsers or download updates over the internet
-5. Updates can be pushed to servers immediately without physical distribution
+Neither is "right". Push-based is fine for many small systems with strong protection on production credentials; GitOps shines when many services deploy to a cluster.
 
-**Who used the software**: Mass-market users accessing web applications (Gmail, Facebook, Amazon) or downloading software updates automatically (antivirus programs, operating system updates).
+## 3. Mental model
 
-**Deployment frequency**: Updates became **much faster**—potentially **multiple times per week**. Why?
-- **No physical constraints**: Updating a website meant copying files to servers
-- **Lower cost**: No manufacturing or shipping costs
-- **Easier rollback**: Bad updates could be reverted by restoring previous files
-- **Faster feedback**: Users encountered new features immediately, providing quick feedback
+CI/CD is an **assembly line with quality inspectors at each station**. Early manufacturing inspected the finished product once, at the end. Modern lines inspect at every station, so a defect is caught where it is cheapest to fix. Pull requests are the stations; workflows are the inspectors.
 
-**Key insight**: With the ability to ship updates quickly came a critical requirement: **automated testing**. When you can deploy multiple times per week, manual testing becomes a bottleneck. This created the need for continuous integration systems.
+## 4. Practical example: the same pipeline in four stages
 
-**Example**: Google could push updates to their search algorithm multiple times per day. If something broke, they could roll back in minutes rather than months. But to do this safely required automated testing to catch regressions before they reached users.
+A conceptual flow (not yet code) that you will build in the capstone:
 
-### Era 4: Multiple Daily Deployments (2010s-Present)
-
-**The Process**:
-Modern high-performing software teams have taken automation to its logical conclusion: deploying updates **multiple times per day**—sometimes dozens or hundreds of times daily.
-
-**How it works**:
-1. Developer makes a code change and commits to version control
-2. **Automated CI system immediately**:
-   - Runs automated tests (unit, integration, end-to-end)
-   - Performs static code analysis
-   - Checks code formatting and style
-   - Builds deployment artifacts
-3. If all checks pass, code is automatically deployed to production
-4. Monitoring systems watch for errors or performance degradation
-5. If issues arise, automated rollback occurs
-
-**Who uses the software**: Everyone. Modern web applications (Netflix, Twitter, GitHub itself), mobile apps, and cloud services all operate this way.
-
-**Deployment frequency**: **Multiple times per day**—the highest-performing teams deploy on every commit that passes tests.
-
-**Why this is possible**:
-- **Comprehensive automated testing**: Tests run in seconds or minutes, providing fast feedback
-- **Continuous Integration tools**: Systems like GitHub Actions automatically run tests on every change
-- **Cloud infrastructure**: Deploying to cloud servers is automated and fast
-- **Feature flags**: New features can be deployed but hidden until ready
-- **Advanced monitoring**: Issues are detected quickly and rollbacks are automated
-
-**Key insight**: At this velocity, **automation isn't optional—it's mandatory**. Human review and manual testing cannot keep pace with dozens of daily deployments. This is where GitHub Actions and similar CI/CD tools become critical infrastructure.
-
-**Example**: Amazon famously deploys code to production every 11.7 seconds on average (as of a few years ago—likely even faster now). This is only possible with extensive automation and continuous integration practices.
-
-## The Birth and Evolution of Continuous Integration
-
-Now that we understand *why* continuous integration became necessary, let's explore how the tooling evolved to meet this need.
-
-### What is Continuous Integration?
-
-**Continuous Integration (CI)** is the practice of automatically integrating code changes from multiple contributors into a shared repository **frequently**—ideally multiple times per day. Each integration is verified by:
-- Automated builds (compiling code or creating deployment artifacts)
-- Automated tests (ensuring new changes don't break existing functionality)
-- Automated checks (linting, security scanning, code quality metrics)
-
-**The core principle**: Integrate early and often, catching problems when they're small and easy to fix rather than letting them accumulate into large, complex merge conflicts and bug clusters.
-
-### Pre-2000: Manual Integration
-
-Before continuous integration tools existed, integration was a **manual**, **scheduled** event—often called "integration hell."
-
-**How it worked**:
-- Developers would work on features in isolation for days or weeks
-- When features were "complete," there would be an "integration day"
-- Multiple developers would try to merge their changes together
-- Merge conflicts were common and difficult to resolve
-- Tests were run manually on specific machines
-- The process could take days or weeks
-
-**Problems**:
-- Long feedback cycles—bugs discovered weeks after they were introduced
-- Large, complex merge conflicts
-- "Works on my machine" syndrome—software behaved differently on different computers
-- No standardization of the build and test process
-
-### 1997: Tinderbox - The Pioneer
-
-**Who created it**: Netscape (later Mozilla)
-
-**What it did**: Tinderbox was one of the first automated continuous integration systems. It would:
-- Monitor the version control system for new commits
-- Automatically attempt to build the software for multiple platforms
-- Report the status of those builds via a web interface
-- Show which commits "broke the build" and on which platforms
-
-**Why it mattered**: This was revolutionary—developers could immediately see if their changes broke the build for any platform. The feedback loop went from weeks to hours.
-
-**Visual representation**:
 ```
-Traditional Approach:          Tinderbox Approach:
-Developer commits code         Developer commits code
-    ↓                              ↓ (seconds)
-(wait days/weeks)              Tinderbox detects commit
-    ↓                              ↓ (minutes)
-Manual build scheduled         Automatic builds for all platforms
-    ↓                              ↓ (minutes)
-Discover it broke              Web interface shows red (failed) or green (passed)
+developer pushes ──▶ validate (lint, test) ──▶ build image ──▶ deploy to staging ──▶ (approval) ──▶ deploy to production
+        │                    │                      │                 │
+        └─ event             └─ fails fast          └─ versioned      └─ verify health
 ```
 
-**Limitations**: Tinderbox primarily focused on building—comprehensive automated testing wasn't yet standard practice.
+## 5. Execution walkthrough
 
-### 2001: CruiseControl - Java's Answer
+Take one change through the line:
 
-**Who created it**: ThoughtWorks
+1. A developer opens a pull request. Validation workflows run; a failing test blocks the merge.
+2. After the merge to `main`, a build workflow creates an image tagged with the commit identifier.
+3. A deployment step (push-based) or a manifest update (GitOps) puts that exact version in staging.
+4. A health check confirms the new version is serving traffic.
+5. A person approves, and the same image (not a rebuild) is promoted to production.
 
-**What it did**: CruiseControl expanded on Tinderbox's ideas with a focus on Java projects:
-- Automated building using Java build tools (Ant, later Maven)
-- Automated test execution as part of the build
-- Plugin architecture for extensibility
-- Email notifications when builds failed
+Step 5 matters: **build once, promote the same artifact**, so what you tested is what you ship.
 
-**Why it mattered**: CruiseControl popularized CI in the enterprise Java world, which was dominant at the time. It demonstrated that automated testing should be integrated with the build process.
+## 6. Common mistakes
 
-**Key innovation**: The **plugin architecture** allowed the community to extend CruiseControl with new capabilities—a pattern that would influence future CI tools.
+| Mistake | Why it hurts | Better |
+|---|---|---|
+| Rebuilding the artifact for each environment | Production may run something that was never tested. | Build once, deploy the same image everywhere. |
+| Treating CI as only "run the tests" | Misses build, release and maintenance automation. | Think in the four categories above. |
+| Long-lived feature branches | Recreates integration hell. | Merge small changes often, behind feature flags if needed. |
+| Choosing a tool by popularity statistics alone | Surveys differ by audience and age quickly. | Choose by where your code lives, your team's skills and your constraints (Chapter 3). |
 
-### 2005: Hudson (Later Jenkins) - The Game Changer
+## 7. Security considerations
 
-**Who created it**: Initially Kohsuke Kawaguchi at Sun Microsystems
+- Push-based deployment means CI holds credentials that can change production. Limit them (Chapter 6 covers short-lived credentials via OIDC), scope them per environment, and require approval for production.
+- GitOps shrinks that exposure but moves trust to the repository: protect the manifest repository's branches as strictly as production itself.
 
-**What it did**: Hudson (which later became Jenkins after Oracle acquired Sun and trademark disputes ensued) brought several major improvements:
-- **User-friendly web interface**: Non-technical users could understand build status
-- **Extensive plugin ecosystem**: Thousands of plugins for virtually any integration need
-- **Distributed builds**: Run builds on multiple machines for speed and parallelization
-- **Support for many languages**: Not just Java—Python, Ruby, JavaScript, etc.
+## 8. Hands-on exercise
 
-**Why it mattered**: Jenkins became (and remains) one of the most popular CI tools because:
-- **Open source and free**: No licensing costs
-- **Highly flexible**: Plugins for everything
-- **Self-hosted**: Organizations maintained control over their infrastructure
-- **Active community**: Continuous improvements and support
+**Goal:** classify real automation in a project you know.
 
-**The trade-off**: Jenkins' flexibility came at a cost—complexity. Setting up and maintaining Jenkins servers, configuring plugins, and managing infrastructure required dedicated DevOps expertise.
+1. Pick any repository you work on, or a well-known open-source project that has a `.github/workflows` directory.
+2. List every workflow file and write, next to each, which of the four categories it belongs to.
+3. For one deployment workflow, decide whether it is push-based or GitOps-style and write down which credentials it needs.
 
-**Jenkins remains popular today**, especially in large enterprises with existing installations and teams skilled in its operation.
+**Success looks like:** a table with one row per workflow, a category, and the trigger event. Workflows that fit none of the four categories deserve a note: they are usually repository chores.
 
-### 2006-2007: Bamboo and TeamCity - Enterprise Integration
+## 9. Verification checklist
 
-**Bamboo (Atlassian)** and **TeamCity (JetBrains)** entered the market with a focus on **integration with broader product ecosystems**:
+- [ ] You can name at least three tools from the timeline and what each introduced.
+- [ ] Your table names the trigger for every workflow.
+- [ ] You can explain in one sentence why "build once, promote the same artifact" is safer.
 
-**Bamboo**:
-- Deep integration with Jira (issue tracking) and Bitbucket (version control)
-- Allows linking builds to specific Jira tickets
-- Deployment pipelines visualized alongside development workflows
+## 10. Knowledge check
 
-**TeamCity**:
-- Tight integration with JetBrains IDEs (IntelliJ IDEA, PyCharm, WebStorm, etc.)
-- Developers could trigger builds and see results directly in their IDE
-- Intelligent test reporting and history tracking
+1. Why did faster releases make automated testing unavoidable?
+2. What problem did Travis CI and CircleCI remove compared with running Jenkins yourself?
+3. Give one advantage and one cost of GitOps compared with push-based deployment.
+4. Which of the four categories does "close issues with no activity for 90 days" belong to?
 
-**Why this mattered**: These tools demonstrated that CI/CD works best when **deeply integrated with the entire software development lifecycle**—version control, issue tracking, code review, and deployment all connected.
+<details>
+<summary>Answers</summary>
 
-This philosophy directly influenced GitHub Actions' design.
+1. Manual testing cannot keep pace with many releases per week or day.
+2. Operating and patching a build server; they provided hosted runners and in-repository configuration.
+3. Advantage: production credentials stay inside the environment, and every change is an auditable Git commit. Cost: an additional agent and repository to operate.
+4. Repository automation.
+</details>
 
-### 2010-2011: Travis CI and Circle CI - Cloud-Native SaaS
+## 11. Key takeaways
 
-**What changed**: Travis CI and Circle CI pioneered the **Software-as-a-Service (SaaS) model** for CI:
-- **GitHub integration**: Linked directly to GitHub repositories
-- **Cloud-hosted runners**: No need to manage CI servers yourself
-- **Free for open source**: Public repositories got free build minutes
-- **Configuration as code**: CI configuration stored in the repository (`.travis.yml`, `.circleci/config.yml`)
+- CI/CD exists because releasing got cheap and manual checking did not scale.
+- CI tools moved from self-operated servers to configuration files in the repository.
+- Four categories of work: validate, build, deploy, maintain.
+- Push-based and GitOps deployment trade simplicity against credential exposure and auditability.
 
-**Why this mattered**: These tools drastically lowered the barrier to entry for CI:
-- **No infrastructure management**: Just add a YAML file to your repository
-- **Faster onboarding**: Start using CI in minutes, not days or weeks
-- **Pay-as-you-go**: Only pay for what you use
+## Sources and further reading
 
-**Example**: Before Travis CI, setting up CI for an open-source project required:
-1. Set up a server (Jenkins)
-2. Install and configure Jenkins
-3. Manage plugins
-4. Configure jobs
-5. Maintain the server (security updates, backups, etc.)
-
-With Travis CI:
-1. Add a `.travis.yml` file to your repository
-2. Enable Travis CI on GitHub
-3. Done
-
-This democratized CI, making it accessible to small teams and individual developers.
-
-### 2015-2016: GitLab CI and Cloud Provider Tools
-
-**GitLab CI/CD**: In 2015, GitLab (a GitHub alternative) introduced integrated CI/CD directly into their platform:
-- **Built into GitLab**: No separate service or integration needed
-- **Unified interface**: Code, issues, merge requests, and CI in one place
-- **Auto DevOps**: Automatic CI/CD pipeline generation based on project detection
-
-**Cloud Providers** (AWS CodeBuild, Google Cloud Build, Azure Pipelines): Starting in 2016, major cloud providers introduced their own CI tools:
-- **AWS CodeBuild**: Integrated with other AWS services (S3, CodeDeploy, etc.)
-- **Google Cloud Build**: Native integration with Google Cloud Platform
-- **Azure Pipelines**: Deep Azure integration
-
-**Why this mattered**: These tools showed that **the future of CI/CD was deep platform integration**—CI works best when it's not a separate system but a native part of your development platform.
-
-### 2018: GitHub Actions - The New Standard
-
-**What it is**: GitHub's native CI/CD platform, launched in 2018.
-
-**Why it matters**:
-- **Massive existing user base**: GitHub hosts 100+ million repositories—CI is available to all of them with minimal friction
-- **Deep GitHub integration**: Native access to all GitHub events (push, PR, issue comments, releases, etc.)
-- **Public marketplace**: Reusable actions shared by the community
-- **Free for open source**: Generous free tier for public repositories
-- **Modern design**: Learned from predecessors' successes and failures
-
-**Key insight**: GitHub Actions was a "late entrance" to the CI/CD space, but because it's integrated into the de facto standard platform for version control, it achieved massive adoption quickly.
-
-**Timeline visualization**:
-```
-1997  2001        2005      2007      2010-11    2015-16  2018
-  |     |           |         |          |          |       |
-Tinder- Cruise    Hudson    Bamboo   Travis CI  GitLab   GitHub
-  box   Control   Jenkins   TeamCity  CircleCI   CI/CD    Actions
-                                                  AWS Build
-```
-
-## The Four Categories of CI/CD Workflows
-
-Understanding what people actually *do* with CI/CD tools helps contextualize GitHub Actions' capabilities. Most workflows fall into four main categories:
-
-### 1. Validation and Quality Checks
-
-**Purpose**: Ensure code meets quality standards before it's merged or deployed.
-
-**Common validation types**:
-
-**Linting**: Checking code formatting, style consistency, and potential errors
-```yaml
-# Example: Checking that all JavaScript follows the same style rules
-- Tabs vs. spaces are consistent
-- Function naming follows conventions
-- No unused variables exist
-```
-
-**Testing**: Verifying functionality at different levels
-- **Unit tests**: Test individual functions or classes in isolation
-- **Integration tests**: Test how different components work together
-- **End-to-end tests**: Simulate real user interactions
-
-**Static analysis**: Examining code without executing it
-- **Security scanning**: Detecting known vulnerabilities in dependencies
-- **Code quality metrics**: Measuring complexity, duplication, maintainability
-- **Type checking**: Ensuring type safety in typed languages
-
-**Why this matters**: Automated validation catches bugs *before they reach production*, when they're cheaper and easier to fix.
-
-**Example**: A developer submits a pull request. Before any human reviewer looks at it, automated checks:
-- Run 500 unit tests (complete in 2 minutes)
-- Scan dependencies for security vulnerabilities
-- Check that code style matches project standards
-- Calculate code coverage metrics
-
-If any check fails, the PR is marked as failing, and the developer can fix issues immediately rather than discovering them days or weeks later.
-
-### 2. Building Deployment Artifacts
-
-**Purpose**: Transform source code into executable software that can be deployed.
-
-**For compiled languages** (Go, Rust, C++, Java):
-- Compile source code into binary executables
-- Bundle executables with required libraries and resources
-- Create platform-specific packages (`.exe` for Windows, `.deb` for Debian, etc.)
-
-**For interpreted languages** (JavaScript, Python, Ruby):
-- Download and bundle all dependencies
-- Minify and optimize code for production
-- Create deployment packages
-
-**For containerized applications**:
-- Build Docker images containing application code and all dependencies
-- Tag images with version numbers
-- Push images to container registries
-
-**Why this matters**: Building should be **reproducible**—the same source code should always produce the same artifact, regardless of which machine builds it. CI systems provide consistent build environments.
-
-**Example**: A Node.js application build might:
-1. Install exact dependency versions from `package-lock.json`
-2. Run TypeScript compiler to generate JavaScript
-3. Bundle all JavaScript files together
-4. Minify for smaller file size
-5. Build a Docker image with the bundled code
-6. Tag the image with the git commit SHA
-
-Now anyone can deploy exactly this version by pulling that Docker image—no ambiguity about which code version is running.
-
-### 3. Deployment
-
-**Purpose**: Move built artifacts from the build environment to servers where end users can access them.
-
-**Two main approaches**:
-
-#### Push-Based Deployment
-The CI system actively pushes code to deployment targets:
-
-**How it works**:
-1. CI system builds deployment artifact (container image, binary, etc.)
-2. CI system authenticates to deployment target (cloud provider, Kubernetes cluster, etc.)
-3. CI system issues deployment commands (e.g., `kubectl apply` for Kubernetes)
-4. Deployment target receives and runs the new version
-
-**Example workflow**:
-```
-Code committed
-    ↓
-GitHub Actions workflow triggered
-    ↓
-Build Docker image
-    ↓
-Push image to registry
-    ↓
-Authenticate to Kubernetes cluster
-    ↓
-Update Kubernetes deployment to use new image
-    ↓
-Kubernetes rolls out new version
-```
-
-**Advantages**: Simple, direct, works for many deployment targets
-**Disadvantages**: CI system needs credentials to access production (security concern)
-
-#### GitOps-Based Deployment
-An agent inside the deployment target pulls updates from version control:
-
-**How it works**:
-1. CI system builds deployment artifact
-2. CI system updates deployment configuration in Git (e.g., changing image tag in Kubernetes manifests)
-3. Agent running inside deployment target (e.g., ArgoCD, Flux) watches Git repository
-4. Agent detects configuration change and pulls the new version
-5. Agent applies the update to the cluster
-
-**Example workflow**:
-```
-Code committed to application repo
-    ↓
-GitHub Actions builds new Docker image tagged v1.2.3
-    ↓
-GitHub Actions commits update to config repo: "use image v1.2.3"
-    ↓
-ArgoCD (running in Kubernetes) detects config repo change
-    ↓
-ArgoCD pulls new image and updates deployment
-```
-
-**Advantages**: Production credentials never leave production environment (more secure), easier to audit what's deployed
-**Disadvantages**: More complex setup, requires running agents
-
-**We'll explore both approaches in depth in the capstone project.**
-
-### 4. Repository Automation
-
-**Purpose**: Automate maintenance and housekeeping tasks for repositories beyond traditional CI/CD.
-
-**Common automation tasks**:
-
-**Release management**:
-- Automatically generate changelogs from commit messages
-- Create GitHub releases with version numbers
-- Tag commits following semantic versioning
-- Build and publish packages to package registries (npm, PyPI, etc.)
-
-**Stale issue management**:
-- Identify issues or PRs with no activity for X days
-- Add "stale" labels
-- Close issues after additional inactivity
-- Send reminders to assignees
-
-**Dependency updates**:
-- Scan for outdated dependencies
-- Create PRs with dependency updates
-- Run tests to verify updates don't break anything
-- Automatically merge updates if tests pass
-
-**Issue triaging**:
-- Automatically label issues based on content
-- Assign issues to appropriate team members
-- Request additional information from reporters
-- Add issues to project boards
-
-**Why this matters**: These automations free up developer time from repetitive tasks, allowing focus on actual feature development.
-
-**Example**: A popular open-source project receives 50 issues per week. Without automation:
-- Maintainer manually reviews each issue
-- Manually adds labels ("bug," "feature request," etc.)
-- Manually assigns to team members
-- Manually follows up on stale issues
-
-This could consume hours per week. With automation:
-- Bot reads issue content and suggests labels
-- Bot assigns based on file paths mentioned in issue
-- Bot auto-closes issues with no activity for 90 days after warning
-
-Maintainer time drops from hours to minutes per week.
-
-## Why GitHub Actions?
-
-With so many CI/CD tools available, why might you specifically choose GitHub Actions? Let's examine the competitive landscape and GitHub Actions' position within it.
-
-### Survey Data: Market Adoption
-
-Two major industry surveys asked developers: "Which CI/CD tools are you using?"
-
-#### CNCF (Cloud Native Computing Foundation) Survey
-
-**Respondent profile**: Developers and organizations using cloud-native technologies, particularly Kubernetes.
-
-**Top results**:
-1. **GitHub Actions** - Most popular
-2. Jenkins
-3. GitLab CI/CD
-4. Argo / Flux (GitOps-specific tools)
-5. Azure Pipelines
-
-**Insight**: Among cloud-native, Kubernetes-using organizations (generally forward-thinking, modern tech stacks), GitHub Actions has achieved top adoption.
-
-#### JetBrains Developer Survey
-
-**Respondent profile**: Broader developer community using JetBrains IDEs (IntelliJ IDEA, PyCharm, etc.)—includes enterprise and legacy systems.
-
-**Top results**:
-1. **Jenkins** - Most popular
-2. GitHub Actions
-3. GitLab CI/CD
-
-**Insight**: In the broader developer ecosystem (including large enterprises with long-running projects), Jenkins still leads due to legacy installations, but GitHub Actions is second and growing rapidly.
-
-**Why the difference?**:
-- **CNCF survey**: Represents modern, greenfield projects more likely to adopt newer tools
-- **JetBrains survey**: Includes many large enterprises with existing Jenkins installations from years ago
-
-**Trend**: GitHub Actions is the default choice for new projects, while Jenkins remains common in established enterprises.
-
-### Comparative Analysis: GitHub Actions vs. Alternatives
-
-Let's compare GitHub Actions with three main alternatives: GitLab CI/CD, Jenkins, and CircleCI.
-
-#### GitHub Actions
-
-**Strengths**:
-
-**1. Minimal barrier to entry if code is on GitHub**:
-- Code already on GitHub → Add a YAML file → CI is running
-- No separate account, no separate service, no integration setup
-- Free tier for public repos and generous free minutes for private repos
-
-**2. Expansive public marketplace**:
-- Thousands of pre-built actions for common tasks
-- Deploy to AWS, Azure, GCP with pre-built actions
-- Setup languages (Node.js, Python, Go, etc.) with one line
-- Community-driven—anyone can publish actions
-
-**3. Market leader benefits**:
-- Strong ecosystem of third-party tools (like Namespace)
-- Extensive documentation and community support
-- Regular feature updates and improvements
-- Large user base means common problems are well-documented
-
-**Weaknesses**:
-
-**1. GitHub lock-in**:
-- Only works with GitHub repositories
-- If you move off GitHub, you must rewrite all CI/CD
-
-**2. Less expressive than some alternatives**:
-- YAML syntax is straightforward but sometimes verbose
-- Difficult to create truly reusable, parameterized workflows
-- Copy-paste is common for similar workflows across repos
-
-**3. Debugging challenges**:
-- Limited ability to debug workflows locally
-- Iteration requires committing changes and watching them run remotely
-- Error messages can be cryptic
-
-**4. Limited observability**:
-- Basic logs and timing data
-- No built-in resource utilization metrics (CPU, memory)
-- No advanced analytics (trends over time, bottleneck identification)
-- Third-party tools (like Namespace) help but add complexity
-
-**Best for**:
-- Teams with code on GitHub (especially starting new projects)
-- Open-source projects (free unlimited builds)
-- Teams wanting quick setup without infrastructure management
-- Organizations already using GitHub Enterprise
-
-#### GitLab CI/CD
-
-**Strengths**:
-
-**1. Unified platform**:
-- Everything in one place: code, issues, merge requests, CI/CD, deployment
-- Single interface to learn
-- No context switching between tools
-
-**2. Auto DevOps**:
-- Automatically detect project type and generate CI/CD pipeline
-- Zero configuration for common project structures
-- Good for beginners
-
-**3. Self-hosted option**:
-- Can run GitLab on your own servers
-- Full control over data and infrastructure
-- Good for organizations with strict security/compliance requirements
-
-**Weaknesses**:
-
-**1. GitLab lock-in**:
-- Similar to GitHub Actions—only works if code is on GitLab
-- Moving to another platform requires rewriting CI/CD
-
-**2. Smaller marketplace**:
-- Fewer pre-built components compared to GitHub Actions
-- More custom scripting required for some integrations
-
-**Best for**:
-- Teams using GitLab for version control
-- Organizations wanting a complete DevOps platform (code + CI/CD + deployment + monitoring)
-- Teams needing self-hosted solutions for compliance
-
-#### Jenkins
-
-**Strengths**:
-
-**1. Extremely mature and feature-rich**:
-- Thousands of plugins for virtually any integration
-- Battle-tested in production for over a decade
-- Handles complex, sophisticated workflows
-
-**2. Platform agnostic**:
-- Works with GitHub, GitLab, Bitbucket, any Git server
-- Can build projects in any language
-- Not tied to any specific ecosystem
-
-**3. Self-hosted with full control**:
-- Run on your own infrastructure
-- Complete customization
-- No external service dependencies
-
-**Weaknesses**:
-
-**1. Complex setup and maintenance**:
-- Requires dedicated infrastructure
-- Managing Jenkins servers, plugins, updates is time-consuming
-- Need DevOps expertise to run effectively
-
-**2. Dated user experience**:
-- UI feels old compared to modern tools
-- Configuration often done through web forms rather than code
-- "Jenkinsfile" for configuration-as-code is more recent addition
-
-**3. Security concerns**:
-- Many plugins mean large attack surface
-- Self-hosted means you're responsible for security updates
-- Historical security vulnerabilities in plugins
-
-**Best for**:
-- Large enterprises with existing Jenkins installations
-- Organizations needing platform-agnostic CI (code on multiple platforms)
-- Teams with dedicated DevOps staff for infrastructure management
-- Complex workflows requiring extensive customization
-
-#### CircleCI
-
-**Strengths**:
-
-**1. Cloud-hosted simplicity**:
-- No infrastructure to manage
-- Modern, clean user interface
-- Good performance and reliability
-
-**2. Platform flexibility**:
-- Works with GitHub, Bitbucket, GitLab
-- Not locked into one version control platform
-
-**3. Advanced features**:
-- Sophisticated caching mechanisms
-- Good support for monorepos
-- Parallelization and test splitting
-
-**Weaknesses**:
-
-**1. Cost**:
-- Can become expensive at scale
-- Pricing based on compute time (like most SaaS CI)
-- Free tier is limited
-
-**2. Requires separate service**:
-- Unlike GitHub Actions or GitLab CI, you need a separate CircleCI account
-- Additional integration to set up
-- One more service to manage
-
-**Best for**:
-- Teams wanting modern CI experience without managing infrastructure
-- Organizations using multiple version control platforms
-- Projects needing advanced features like test splitting
-
-### Decision Matrix
-
-| Priority | Best Choice | Why |
-|----------|-------------|-----|
-| Code on GitHub | GitHub Actions | Minimal friction, deep integration |
-| Code on GitLab | GitLab CI/CD | Same reasons, GitLab-specific |
-| Multi-platform code | Jenkins or CircleCI | Not locked to one provider |
-| Complex workflows | Jenkins | Maximum flexibility |
-| Quick setup, no maintenance | GitHub Actions or CircleCI | SaaS model, no infrastructure |
-| Self-hosted requirement | Jenkins or GitLab (self-hosted) | Full control |
-| Budget-conscious | GitHub Actions (public repos) | Free for open source |
-
-## Key Takeaways
-
-- **Software delivery evolved** from months-long cycles with physical media to multiple deployments per day via the internet
-- **Continuous Integration emerged** as a necessity when deployment frequency increased—manual testing couldn't keep pace
-- **CI tooling evolved** from simple build automation (Tinderbox, 1997) to sophisticated platforms deeply integrated with development workflows (GitHub Actions, 2018)
-- **Modern CI/CD performs four main functions**: validation/testing, building artifacts, deployment, and repository automation
-- **GitHub Actions succeeded** by lowering barriers to entry, integrating deeply with GitHub's massive user base, and providing a rich marketplace ecosystem
-- **Tool choice depends on context**: GitHub Actions excels for GitHub-hosted projects, while alternatives like Jenkins, GitLab CI, and CircleCI have specific use cases
-
-## Next Chapter
-
-Now that we understand the historical context and competitive landscape, Chapter 3 will dive deeper into the specific advantages of GitHub Actions, exploring the features that make it the right choice for many modern software teams and examining real-world usage patterns.
+- Original notes: `git show master:02_history_and_motivation.md`. The unsourced statistics from those notes (deployment-frequency claims, survey rankings) were removed rather than repeated; the tool timeline was kept and checked for plausibility, but dates are approximate.
+- Official docs: [Understanding GitHub Actions](https://docs.github.com/en/actions) (start page).

@@ -1,775 +1,312 @@
-# Chapter 11: Best Practices - Building Production-Grade Workflows
+# Chapter 11: Best Practices: Performance, Maintainability and Security
 
-## Overview
+> **Level:** intermediate → advanced · **Time:** 3 hours · **Prerequisites:** [Chapters 5–10](05_core_features.md)
+> **Next:** [Chapter 12: Capstone, Part 1: The Test Workflow](12_test_workflow.md)
 
-Creating workflows that "just work" is one thing. Building **production-grade automation** that's performant, maintainable, and secure requires intentional design and adherence to best practices.
+## Learning objectives
 
-This chapter covers principles and patterns that separate amateur workflows from professional ones. You'll learn:
-- **Performance optimization** - Making workflows fast and efficient
-- **Maintainability patterns** - Keeping workflows manageable as they grow
-- **Security practices** - Protecting credentials and preventing attacks
-- **Monorepo vs. multirepo considerations** - Architectural tradeoffs
+After this chapter you can:
 
-**Goal**: Apply these practices in your projects to build robust, scalable automation.
+- Measure a pipeline and decide what to optimize (wait less, do less, use resources better).
+- Decide what to cache and what not to.
+- Keep many repositories or services consistent with a standard task interface, composite actions and reusable workflows.
+- Weigh monorepo against multirepo for CI.
+- Apply a security baseline: least privilege, no long-lived credentials, SHA pinning, allow-lists, protected environments, safe handling of pull requests from forks and of untrusted input.
+- Audit a workflow with a checklist.
 
-## Category 1: Performance Best Practices
+## 1. Problem statement
 
-### Principle 1: Measure Before Optimizing
+A workflow that "works" can still be slow (developers stop waiting for it), brittle (nobody dares to change it), or dangerous (a pull request can steal your deploy keys). This chapter turns experience into rules you can check.
 
-**Rule**: Never optimize without data.
+## 2. Core explanation
 
-**Why**: Guessing where time is spent leads to wasted effort. Measure first.
+### Part A: Performance
 
-**How to measure**:
-1. **Export timing data** - Use Honeycomb (Chapter 10) or runner insights
-2. **Identify bottlenecks** - Which steps take 80% of time?
-3. **Set baseline** - Record current performance
-4. **Optimize targeted** - Focus on slowest parts
-5. **Validate improvement** - Measure again, confirm speedup
+#### Lesson 11.1: Measure first
 
-**Example workflow**:
-```
-Current state: Workflow takes 8 minutes
-└─ Measure: Install dependencies = 5 minutes (62% of time)
-   └─ Optimize: Add caching
-      └─ New measure: Install dependencies = 30 seconds
-         └─ Result: Workflow now 3.5 minutes (56% faster)
-```
+Optimize the slowest critical path, not what you feel is slow. Open recent runs and look at the **critical path**: the longest chain of dependent jobs, since parallel jobs don't add up. Then ask, for each long step: *can I wait less, do less, or use resources better?* Keep a baseline (median duration of the last 20 runs; see the `gh run list` snippet in Chapter 10) so you can tell whether a change helped.
 
-**Anti-pattern**: "Let's add caching everywhere" without knowing what's slow.
+#### Lesson 11.2: Wait less
 
-### Principle 2: Spend Less Time Waiting
+Time is lost in queues and in sequential steps.
 
-**Subcategory A: Reduce Queue Time**
+| Technique | Notes |
+|---|---|
+| **Parallelize independent jobs** | Lint, unit tests, and type checks usually don't `need` each other |
+| **Split slow test suites** across matrix legs | Use your test runner's sharding |
+| **Cancel superseded runs** | `concurrency` with `cancel-in-progress` for CI |
+| **Faster runners** | Larger or vendor-provided runners cost more per minute but can finish sooner; compare cost per run, not per minute |
+| **Run only what's affected** | Path filters (below) |
 
-**Problem**: Jobs wait minutes for available runner.
+#### Lesson 11.3: Do less work
 
-**Solutions**:
-- **Use faster runners** - Namespace, BuildJet (instant provisioning)
-- **Add self-hosted runners** - No queue for dedicated hardware
-- **Stagger workflows** - Use `concurrency` to limit simultaneous runs
+- **Path and change filters.** Workflow-level `paths:` skips an entire workflow when only unrelated files changed. Be careful with required checks: a workflow skipped by `paths:` never reports a status, so a *required* check that is skipped by path filters can leave pull requests "pending" forever. A common fix is a lightweight always-running job that decides what to run (Chapter 12's pattern) and a final "all-done" gate job that is the only required check.
+- **Job-level conditions.** An `if:` on a job (for example `if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}`) is **not** a path filter; it still starts a workflow run and only skips jobs. (GitHub also natively honors `[skip ci]`-style phrases in commit messages for `push` and `pull_request` events; see the docs.)
+- **Cache** dependencies and tool downloads (Lesson 11.5).
+- **Don't rebuild**: build once, pass the artifact or image to later jobs (Chapter 2's "build once, promote").
+- **Shallow clones.** `actions/checkout` fetches one commit by default (`fetch-depth: 1`), which is fastest. Use `fetch-depth: 0` only when you need history (changelogs, `git describe`).
 
-**Subcategory B: Fail Fast**
+#### Lesson 11.4: Use resources better
 
-**Problem**: Workflow runs 10 minutes, then fails on final step.
+- Match the runner to the workload: a CPU-bound compile benefits from more cores; a lint job doesn't.
+- Use **Arm64 runners** (`ubuntu-24.04-arm`) to build Arm images natively instead of emulating them with QEMU, which is much slower (Chapter 13).
+- Remember GitHub-hosted jobs start on fresh machines: tools that are pre-installed on the runner image don't need installing; check the [runner image software lists](https://github.com/actions/runner-images).
+- Self-hosted runners can keep warm caches, at the price of operations and security work.
+- Set `timeout-minutes` on every job so a hang doesn't burn a six-hour default.
 
-**Solution**: Run likely-to-fail tests first.
+#### Lesson 11.5: What to cache
 
-**Example ordering**:
+| Layer | Cache? | How |
+|---|---|---|
+| Git checkout | Usually not: shallow clone is fast; large repos may benefit from sparse checkout | `fetch-depth`, `sparse-checkout` |
+| Language toolchain | Often pre-installed; if downloaded, cache via setup action | `actions/setup-*` with `cache:` |
+| Dependency downloads | **Yes**, keyed on the lock file | `actions/cache@v4`, or setup-action `cache:` |
+| Build/test intermediates | Sometimes (incremental compilers, Gradle/Bazel caches) | Key on source + lock hash; verify correctness |
+| Container layers | **Yes** with Buildx: `cache-from`/`cache-to` (`type=gha` or a registry cache) | Chapter 13 |
+
+Caching trade-offs: the cache has size limits and eviction (Chapter 6); restoring a very large cache can take longer than rebuilding; a bad key serves stale data; and shared caches can be poisoned. Measure restore time against rebuild time.
+
+### Part B: Maintainability
+
+#### Lesson 11.6: A standard CI/CD interface
+
+If every service builds differently, every workflow differs. Define a **standard set of task names** (`install`, `lint`, `test`, `build`, `dev`) implemented per service in its `Taskfile.yml` (or `Makefile`, or `package.json` scripts), and have workflows call only those names. Developers get the same commands locally; workflow files become near-identical and thus reusable.
+
 ```yaml
 steps:
-  # 1. Fastest checks first
-  - name: Lint (10 seconds, often fails)
-    run: npm run lint
-  
-  # 2. Unit tests (2 minutes, occasionally fail)
-  - name: Unit tests
-    run: npm test
-  
-  # 3. Build (3 minutes, rarely fails)
-  - name: Build
-    run: npm run build
-  
-  # 4. Integration tests (5 minutes, rarely fail)
-  - name: Integration tests
-    run: npm run test:integration
-```
-
-**Rationale**: Catch syntax errors in 10 seconds, not 10 minutes.
-
-### Principle 3: Do Less Work
-
-**Technique A: Conditional Execution**
-
-**Path filters** (workflow level):
-```yaml
-on:
-  push:
-    paths:
-      - 'src/**'
-      - 'package.json'
-```
-
-**Effect**: Only runs when relevant files change.
-
-**Path filters** (job level):
-```yaml
-jobs:
-  frontend:
-    if: contains(github.event.head_commit.message, '[frontend]')
-    # ...
-```
-
-**Changed file detection** (step level):
-```yaml
-- name: Detect changes
-  id: changes
-  uses: dorny/paths-filter@v2
-  with:
-    filters: |
-      frontend:
-        - 'frontend/**'
-      backend:
-        - 'backend/**'
-
-- name: Build frontend
-  if: steps.changes.outputs.frontend == 'true'
-  run: npm run build
-```
-
-**Technique B: Caching**
-
-**Avoid repeating work from previous runs**.
-
-**Dependency caching** (built into setup actions):
-```yaml
-- uses: actions/setup-node@v4
-  with:
-    node-version: '20'
-    cache: 'npm'  # Caches node_modules
-```
-
-**Manual caching**:
-```yaml
-- name: Cache build artifacts
-  uses: actions/cache@v3
-  with:
-    path: dist/
-    key: build-${{ hashFiles('src/**') }}
-```
-
-**When cache hit**: Restores in seconds instead of rebuilding.
-
-### Principle 4: Improve Resource Utilization
-
-**Technique A: Parallelize Jobs**
-
-**Sequential** (slow):
-```yaml
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - run: npm test
-  
-  lint:
-    needs: test  # Waits for test
-    runs-on: ubuntu-latest
-    steps:
-      - run: npm run lint
-```
-
-**Total time**: test time + lint time
-
-**Parallel** (fast):
-```yaml
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - run: npm test
-  
-  lint:
-    runs-on: ubuntu-latest  # No dependency
-    steps:
-      - run: npm run lint
-```
-
-**Total time**: max(test time, lint time)
-
-**Technique B: Parallelize Within Job (Matrix)**
-
-**Sequential builds**:
-```yaml
-steps:
-  - run: npm run build:linux
-  - run: npm run build:mac
-  - run: npm run build:windows
-```
-
-**Matrix builds** (parallel):
-```yaml
-strategy:
-  matrix:
-    os: [ubuntu-latest, macos-latest, windows-latest]
-runs-on: ${{ matrix.os }}
-steps:
-  - run: npm run build
-```
-
-**Technique C: Avoid Emulation**
-
-**Problem**: Building ARM64 image on AMD64 runner (or vice versa) uses QEMU emulation.
-
-**Cost**: 5-10x slower than native builds.
-
-**Solution A**: Use native architecture runners
-```yaml
-jobs:
-  build-amd64:
-    runs-on: ubuntu-latest  # AMD64
-    steps:
-      - run: docker build --platform linux/amd64 .
-  
-  build-arm64:
-    runs-on: ubuntu-latest-arm  # ARM64
-    steps:
-      - run: docker build --platform linux/arm64 .
-```
-
-**Solution B**: Remote builders (Namespace, Depot)
-- Build both architectures natively in parallel
-- Merge into multi-arch image
-- 10x faster than emulation
-
-### Principle 5: Monitor Performance Over Time
-
-**Problem**: Workflows get slower as project grows.
-
-**Solution**: Track trends, catch regressions early.
-
-**Approaches**:
-1. **Weekly reviews** - Check Honeycomb dashboards
-2. **Automated alerts** - Notify when p95 exceeds threshold
-3. **Performance budgets** - "CI must complete <5 minutes"
-
-**Example alert**:
-```
-⚠️ Performance Regression Detected
-Workflow: Build and Test
-Average duration: 6m 32s (was 4m 12s last week)
-Slowest step: Install dependencies (4m 15s, +3 minutes)
-Action: Investigate dependency caching
-```
-
-## Caching Strategies: What to Cache
-
-### 1. Git Checkout
-
-**Use case**: Large repositories (>1GB).
-
-**Benefit**: Only pull delta, not full history.
-
-**Implementation**:
-```yaml
-- uses: actions/cache@v3
-  with:
-    path: .git
-    key: git-${{ github.sha }}
-    restore-keys: git-
-```
-
-### 2. Language Toolchain
-
-**Use case**: Custom version of Node.js, Python, Go, etc.
-
-**Benefit**: Avoid downloading/installing each run.
-
-**Example** (custom Node.js):
-```yaml
-- uses: actions/cache@v3
-  with:
-    path: ~/.nvm
-    key: node-${{ hashFiles('.nvmrc') }}
-```
-
-### 3. Dependency Downloads
-
-**Most impactful caching**.
-
-**Built-in** (setup actions):
-```yaml
-- uses: actions/setup-node@v4
-  with:
-    cache: 'npm'
-
-- uses: actions/setup-python@v4
-  with:
-    cache: 'pip'
-
-- uses: actions/setup-go@v4
-  with:
-    cache: true
-```
-
-**Manual** (custom package managers):
-```yaml
-- uses: actions/cache@v3
-  with:
-    path: ~/.cargo
-    key: cargo-${{ hashFiles('Cargo.lock') }}
-```
-
-### 4. Build and Test Artifacts
-
-**Use case**: Expensive compilation outputs.
-
-**Example**:
-```yaml
-- uses: actions/cache@v3
-  with:
-    path: target/release/
-    key: build-${{ hashFiles('src/**', 'Cargo.toml') }}
-```
-
-### 5. Container Images and Layers
-
-**A. Base Image Caching**
-
-**Problem**: Pulling `node:18` every build.
-
-**Solution**: Runner-level cache (automatic with most runners).
-
-**B. Layer Caching**
-
-**Problem**: Rebuilding unchanged layers.
-
-**Solution**: Docker Build Cache.
-
-**GitHub Actions cache**:
-```yaml
-- uses: docker/build-push-action@v5
-  with:
-    cache-from: type=gha
-    cache-to: type=gha,mode=max
-```
-
-**Registry cache**:
-```yaml
-- uses: docker/build-push-action@v5
-  with:
-    cache-from: type=registry,ref=ghcr.io/user/app:buildcache
-    cache-to: type=registry,ref=ghcr.io/user/app:buildcache,mode=max
-```
-
-**C. Cache Mounts** (BuildKit)
-
-**Use case**: npm cache within Dockerfile.
-
-**Dockerfile**:
-```dockerfile
-RUN --mount=type=cache,target=/root/.npm \
-    npm install
-```
-
-**Effect**: npm cache persists across builds, speeds up `npm install` dramatically.
-
-## Category 2: Maintainability Best Practices
-
-### Principle 1: Define Standard CI/CD API
-
-**Problem**: Each service has different build/test commands.
-
-**Solution**: Standardize interface with task runner.
-
-**Example** (taskfile.yml):
-```yaml
-version: '3'
-
-tasks:
-  install:
-    desc: Install dependencies
-    cmds:
-      - npm ci
-  
-  test:
-    desc: Run tests
-    cmds:
-      - npm test
-  
-  build:
-    desc: Build application
-    cmds:
-      - npm run build
-  
-  dev:
-    desc: Start development server
-    cmds:
-      - npm run dev
-```
-
-**Every service has same commands**:
-- `task install`
-- `task test`
-- `task build`
-- `task dev`
-
-**Workflow benefits**:
-```yaml
-steps:
-  - uses: actions/checkout@v4
-  - run: task install
-  - run: task test
-  - run: task build
-```
-
-**Works for any service** - frontend, backend, microservice, library.
-
-**Developer benefits**:
-- Clone any repo
-- Run `task dev`
-- Immediately productive
-
-### Principle 2: Use Composite Actions and Reusable Workflows
-
-**Avoid copy-paste**.
-
-**Composite action** (`.github/actions/setup-dependencies/action.yml`):
-```yaml
-name: Setup Dependencies
-runs:
-  using: composite
-  steps:
-    - uses: actions/setup-node@v4
-      with:
-        node-version-file: '.nvmrc'
-        cache: 'npm'
-    
-    - name: Install task
-      shell: bash
-      run: |
-        wget -qO- https://taskfile.dev/install.sh | sh
-        sudo mv ./bin/task /usr/local/bin/
-    
-    - run: task install
-      shell: bash
-```
-
-**Usage** (any workflow):
-```yaml
-steps:
-  - uses: actions/checkout@v4
-  - uses: ./.github/actions/setup-dependencies
+  - uses: actions/checkout@v5
+  - uses: ./.github/actions/setup          # composite action: toolchain + task
   - run: task test
 ```
 
-**Benefit**: Change setup once, applies everywhere.
+#### Lesson 11.7: Share via composite actions and reusable workflows
 
-### Principle 3: Set Up Local Development Tooling
+Use Chapter 8's rules: composite action for a few steps; reusable workflow for whole stages. Version the shared repository with tags and have callers pin to them. Avoid piping install scripts straight into a shell (`curl … | sh`) in shared actions; use a pinned setup action (for example `go-task/setup-task@v1`) so the supply chain is explicit.
 
-**From Chapter 10**:
-- VS Code extensions (GitHub Actions, YAML, Rainbow Indent)
-- Act for local workflow testing
-- Taskfile for extracting logic from YAML
+#### Lesson 11.8: Monorepo or multirepo
 
-**Why this matters for maintainability**:
-- Faster iteration = more time for quality improvements
-- Easier to refactor with quick feedback
-- Lower barrier for team members to contribute
+| | Monorepo | Multirepo |
+|---|---|---|
+| Workflow sprawl | One set of workflows covers many services; needs change detection | Each repo has its own, duplicated workflows (reduce with reusable workflows) |
+| Atomic cross-service change | Easy: one PR | Needs coordinated PRs and versioning |
+| CI cost | Risk of running everything for every change → needs path filtering and caching | Naturally scoped |
+| Permissions | Coarse: everyone with write access can change every service's pipeline | Fine-grained per repo |
+| Required checks | Tricky with path filters | Simple |
+| Tooling | Often needs build-graph tooling at scale | Dependency versioning between repos |
 
-## Decision Frameworks (Revisited)
+Neither is right in general. If you choose a monorepo, invest in change detection and a single "gate" job. If you choose multirepo, invest in reusable workflows and Dependabot-based version propagation.
 
-### Reusability Framework
+### Part C: Security
 
-```
-Do I need to reuse logic across workflows/repos?
-├─ NO → Standard workflow (no abstraction)
-└─ YES → Does it need to enforce standardization?
-    ├─ YES → Reusable workflow
-    └─ NO → Composite action
-```
+#### Lesson 11.9: Least privilege
 
-### Implementation Framework
+Set `permissions: contents: read` at workflow level and elevate per job (Chapter 6). Also set the organization/repository default **Workflow permissions** to read-only (**Settings → Actions → General**), so that a workflow without a `permissions:` block starts with minimal rights. Review the defaults of older repositories: older repositories and organizations may default to read-write.
 
-```
-Found reputable marketplace action?
-├─ YES → Use it
-└─ NO → Is logic simple (1-2 commands)?
-    ├─ YES → Inline bash
-    └─ NO → Complex logic needed?
-        ├─ BASH SUFFICIENT → External task file
-        └─ NEED EXPRESSIVITY → Need dependencies?
-            ├─ NO → In-repo script (Python/Node)
-            └─ YES → Custom action
-                ├─ JAVASCRIPT → JS/TS action
-                └─ OTHER → Container action
-```
+#### Lesson 11.10: No long-lived credentials
 
-## Category 3: Monorepo vs. Multirepo Considerations
+Use OIDC for AWS, Google Cloud, Azure, Vault and others (Chapter 6). Where a static secret is unavoidable, scope it to one environment, make it narrow (read-only, one resource), and rotate it. Prefer GitHub App tokens to personal access tokens for automation that must push or trigger workflows.
 
-### Comparison Matrix
+#### Lesson 11.11: Control which actions can run, and pin them
 
-| Aspect | Monorepo | Multirepo |
-|--------|----------|-----------|
-| **Reusing Logic** | Easy (relative paths) | Harder (requires shared repo) |
-| **Discoverability** | Easy (one codebase search) | Harder (document patterns) |
-| **Performance (Running Only What's Needed)** | Hard (path filtering required) | Easy (repo boundaries) |
-| **Caching** | Hard (scoped keys needed) | Easy (automatic isolation) |
-| **Artifacts** | Easy (within repo) | Hard (external registry) |
-| **Permissions** | Easier (one repo) | Granular (per-repo) |
-| **Required Checks** | Hard (granularity limited) | Easy (per-repo config) |
-| **Scale** | Risk of runner contention | Natural isolation |
-| **Dependency Updates** | Atomic (one PR) | Scattered (many PRs) |
-| **Auditing** | Easy (one place) | Hard (many places) |
-| **Ownership** | Requires CODEOWNERS | Clear by repo |
+- In **Settings → Actions → General** you can allow only actions from your organization, GitHub, verified creators, or an explicit allow-list, and (where available) require actions to be pinned to a full commit SHA.
+- Pin third-party actions to SHAs and update with Dependabot (Chapter 7).
+- Review changes to `.github/workflows/**` like code that runs with production access: use **CODEOWNERS** so the security or platform team must approve.
 
-### Monorepo: Key Considerations
+#### Lesson 11.12: Pull requests and untrusted code
 
-**Reusing logic**: ✅ Easy
+| Trigger | Runs with | Risk |
+|---|---|---|
+| `pull_request` | Workflow from the merge commit; for fork PRs a **read-only token and no secrets** | Low: safe for tests |
+| `pull_request_target` | Workflow from the **base** branch with a normal token and secrets | **High** if it checks out and runs the PR's code. Use only for metadata tasks (labeling), never to build or run PR code |
+| `workflow_run` | Triggered after another workflow; has secrets | Same pitfall: do not execute artifacts or checkouts from untrusted PRs |
+| `issue_comment`, `issues` | Base-branch context with secrets | Treat comment text as untrusted input |
+
+Configure **Settings → Actions → General → Fork pull request workflows** to require approval for first-time or all outside contributors before their workflows run. Never "fix" a failing fork-PR workflow by switching to `pull_request_target` and checking out the PR head.
+
+#### Lesson 11.13: Script injection and untrusted input
+
+Treat `github.event.*` text fields (PR titles, issue bodies, branch names, commit messages), `github.head_ref`, workflow inputs, and artifacts from other runs as attacker-controlled. Never place `${{ … }}` of such values inside `run:` scripts or `github-script` code; pass them through `env:` (Chapter 5). Run `actionlint`, which flags many of these patterns.
+
+#### Lesson 11.14: Protect environments and self-hosted runners
+
+- Put deployment secrets in **environments** with required reviewers, deployment branch restrictions and (optionally) wait timers. A job gets the environment's secrets only after approval.
+- Self-hosted runners: do not attach to public repositories; use ephemeral runners; isolate the network; don't reuse a runner between trust levels.
+
+#### Lesson 11.15: Audit checklist
+
+See Section 10. Use it in code review of any workflow change.
+
+## 3. Mental model
+
+Think of three dials: **speed** (wait less, do less, use resources better), **clarity** (a standard interface and shared building blocks), and **blast radius** (what a mistake or a compromised dependency can reach). Good pipelines are fast because they're simple, simple because they are standardized, and safe because every credential and permission is narrowly scoped.
+
+## 4. Syntax breakdown
+
+A workflow that applies many of the rules:
+
+| Rule | Syntax |
+|---|---|
+| Least privilege | `permissions: { contents: read }` |
+| Cancel superseded | `concurrency: { group: …, cancel-in-progress: true }` |
+| Bound runtime | `timeout-minutes: 15` |
+| Pin action | `uses: owner/repo@<40-char SHA>  # vX.Y.Z` |
+| Untrusted input | `env: TITLE: ${{ github.event.pull_request.title }}` then `"$TITLE"` |
+| Gate job | `needs: [...]`, `if: always()`, check results |
+| Production gate | `environment: production` |
+
+## 5. Practical example: a gate job and safe input handling
+
 ```yaml
-- uses: ./.github/actions/shared-setup
-```
+name: CI
 
-**Path filtering**: ⚠️ Critical
-```yaml
 on:
+  pull_request:
   push:
-    paths:
-      - 'services/api/**'
-      - '.github/workflows/api.yml'
-```
+    branches: [main]
 
-**Without filtering**: Every push triggers all workflows.
-
-**Caching**: ⚠️ Needs scoping
-```yaml
-- uses: actions/cache@v3
-  with:
-    path: services/api/node_modules
-    key: api-deps-${{ hashFiles('services/api/package-lock.json') }}
-```
-
-**Without scoping**: Cache collisions between services.
-
-**Dependency updates**: ✅ Atomic
-- Single Dependabot PR updates all services
-- Test all together, merge atomically
-
-### Multirepo: Key Considerations
-
-**Reusing logic**: ⚠️ Requires shared repo
-```yaml
-- uses: org/devops-actions/.github/actions/setup@main
-```
-
-**Discoverability**: ⚠️ Needs documentation
-- Maintain catalog of shared workflows/actions
-- Onboarding docs for new services
-
-**Caching**: ✅ Automatic isolation
-- Each repo has own cache namespace
-- No key collision risk
-
-**Dependency updates**: ⚠️ Scattered
-- Dependabot creates PRs in each repo
-- Need tooling to track rollout across repos
-
-**Permissions**: ✅ Granular
-- Production repo: strict approvals
-- Staging repo: auto-deploy
-- Easy to configure per-repo
-
-## Category 4: Security Best Practices
-
-### Principle 1: Minimum Permissions
-
-**Default** (too permissive):
-```yaml
-# Implicit: permissions: read-write for all scopes
-```
-
-**Better** (explicit minimum):
-```yaml
 permissions:
-  contents: read        # Read repo
-  pull-requests: write  # Comment on PRs
-```
+  contents: read
 
-**Best** (per-job permissions):
-```yaml
-permissions: {}  # Workflow default: none
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    permissions:
-      contents: read  # Only read access
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-  
-  deploy:
-    permissions:
-      contents: read
-      id-token: write  # OIDC token
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: go-task/setup-task@v1
+      - run: task test
+
+  label-title:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
     steps:
-      # Deploy steps
-```
+      - name: Show PR title safely
+        env:
+          TITLE: ${{ github.event.pull_request.title }}    # untrusted: via env, never inline
+        run: |
+          printf 'Title: %s\n' "$TITLE"
 
-### Principle 2: Avoid Long-Lived Credentials
-
-**Anti-pattern**: Static AWS keys
-```yaml
-- uses: aws-actions/configure-aws-credentials@v4
-  with:
-    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-```
-
-**Problems**:
-- Keys don't expire
-- Rotation requires secret updates
-- Broader blast radius if leaked
-
-**Better**: OIDC (short-lived tokens)
-```yaml
-- uses: aws-actions/configure-aws-credentials@v4
-  with:
-    role-to-assume: arn:aws:iam::123456789012:role/GitHubActions
-    aws-region: us-east-1
-```
-
-**Benefits**:
-- Tokens expire after job
-- No secrets to rotate
-- Audit trail in AWS CloudTrail
-
-### Principle 3: Action Allow Lists
-
-**Prevent unapproved actions**.
-
-**Organization settings**:
-1. Settings → Actions → General
-2. "Allow select actions"
-3. Specify:
-   - `actions/*` (GitHub official)
-   - `org/repo/*` (your organization)
-   - `docker/*` (verified publishers)
-
-**Effect**: Block unknown/unvetted actions.
-
-### Principle 4: Pin Actions to Commit SHA
-
-**Vulnerable** (tag can be moved):
-```yaml
-- uses: some-action@v1.2.3
-```
-
-**Attack**: Maintainer or attacker moves tag to malicious code.
-
-**Secure** (immutable commit):
-```yaml
-- uses: some-action@abc123def456...  # Full commit SHA
-```
-
-**Effect**: Always runs exact code, even if tag moved.
-
-**Maintenance**: Use Dependabot to update SHAs automatically.
-
-### Principle 5: Restrict Self-Hosted Runner Access
-
-**Danger**: Fork PRs running on self-hosted runners.
-
-**Attack scenario**:
-1. Attacker forks public repo
-2. Modifies workflow to exfiltrate secrets
-3. Opens PR
-4. Workflow runs on your self-hosted runner
-5. Secrets exposed
-
-**Solution**: Disable fork PR access
-
-**Settings → Actions → General**:
-- ☐ Run workflows from fork pull requests
-
-**For public repos with self-hosted runners**: Critical security control.
-
-### Principle 6: Use Environment Protection
-
-**Protect production deployments**.
-
-**Environment configuration**:
-1. Settings → Environments → New environment
-2. Name: "production"
-3. Protection rules:
-   - ✅ Required reviewers: @senior-eng, @ops-team
-   - ✅ Wait timer: 5 minutes
-   - ✅ Allowed branches: `main` only
-
-**Workflow**:
-```yaml
-jobs:
-  deploy-production:
-    runs-on: ubuntu-latest
-    environment: production  # Requires approval
+  # The ONE check to mark as required in branch protection
+  ci-ok:
+    if: always()
+    needs: [test, label-title]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Deploy
-        run: kubectl apply -f production/
+      - name: Fail if any needed job failed or was cancelled
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "results: $RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled)"'; then exit 1; fi
 ```
 
-**Effect**: Deploy to production only after human approval.
+## 6. Execution walkthrough
 
-## Best Practices Summary Checklist
+1. A pull request starts the workflow. `test` and `label-title` run in parallel.
+2. `label-title` receives the title as data in an environment variable; a malicious title such as `"; rm -rf ~; "` is printed literally, not executed.
+3. `ci-ok` waits for both, runs even if one failed (`always()`), collects `needs.*.result` and exits non-zero if any job failed or was cancelled. Jobs that were *skipped* are accepted, which keeps the gate green when parts of the pipeline are legitimately skipped.
+4. Branch protection requires only `ci-ok`, so adding or renaming jobs doesn't require editing the protection rule, and skipped jobs can't block merges.
 
-### Performance
-- [ ] Measure workflow performance (Honeycomb or runner insights)
-- [ ] Enable dependency caching (setup action `cache:` parameter)
-- [ ] Use path filters to skip unnecessary runs
-- [ ] Fail fast (run linting before slow tests)
-- [ ] Parallelize independent jobs
-- [ ] Use matrix strategies for similar jobs
-- [ ] Avoid emulation (use native architecture runners)
-- [ ] Monitor trends over time
+## 7. Common mistakes
 
-### Maintainability
-- [ ] Define standard task commands (install, test, build, dev)
-- [ ] Extract repeated logic into composite actions
-- [ ] Use reusable workflows for standardized processes
-- [ ] Set up local development tools (Act, VS Code extensions)
-- [ ] Document shared actions/workflows (if multirepo)
-- [ ] Version shared workflows (tag releases)
+| Mistake | Effect | Fix |
+|---|---|---|
+| Making path-filtered jobs "required checks" | PRs stuck "waiting" | A single always-running gate job |
+| Calling a job-level `if` on the commit message a "path filter" | Misunderstanding of cost: the workflow still starts | Use `paths:` for file-based filtering |
+| Caching without measuring | Restores slower than rebuilds | Time both |
+| `pull_request_target` + checkout of PR head | Secrets exposed to attacker code | Use `pull_request`, or split into untrusted build and trusted comment workflows with care |
+| Required reviewers missing on production | Anyone with write access can deploy | Environments with reviewers |
+| Interpolating `${{ github.head_ref }}` in `run:` | Injection | `env:` |
+| Long-lived cloud keys in repository secrets | Large blast radius | OIDC |
+| Org default token permission = read-write | Forgotten `permissions:` is dangerous | Set default to read-only |
+| `curl … \| sh` in shared actions | Unpinned supply chain | Pinned setup action |
 
-### Security
-- [ ] Set minimum permissions per job
-- [ ] Use OIDC instead of static credentials
-- [ ] Pin actions to commit SHAs
-- [ ] Set up action allow lists (organizations)
-- [ ] Disable fork PR access for self-hosted runners
-- [ ] Require approvals for production environments
-- [ ] Rotate secrets regularly (or eliminate with OIDC)
-- [ ] Audit third-party action code before using
+## 8. Security considerations (summary of this chapter's rules)
 
-### Architecture
-- [ ] Choose monorepo or multirepo based on team size/structure
-- [ ] If monorepo: implement robust path filtering
-- [ ] If monorepo: scope cache keys carefully
-- [ ] If multirepo: create shared DevOps repo
-- [ ] If multirepo: document reusable workflows
-- [ ] Define ownership (CODEOWNERS file)
+1. Default `GITHUB_TOKEN` to read-only; grant scopes per job.
+2. OIDC over static keys; environment-scoped secrets.
+3. Pin third-party actions to SHAs; restrict the allowed set; automate updates.
+4. Treat PRs from forks, comments, issue text, branch names, inputs and artifacts as hostile.
+5. Never run untrusted code in a privileged trigger.
+6. Protect workflow files with CODEOWNERS and branch protection.
+7. Use environments with reviewers for production.
+8. Keep self-hosted runners private, ephemeral and isolated.
+9. Set `timeout-minutes`, `concurrency` and logging hygiene.
 
-## Key Takeaways
+## 9. Hands-on exercise
 
-**Performance**:
-1. Measure before optimizing
-2. Fail fast, cache aggressively
-3. Parallelize everything possible
+**Goal:** harden and speed up a workflow, then prove the gate works.
 
-**Maintainability**:
-1. Standardize CI/CD interface (task commands)
-2. DRY principle (composite actions, reusable workflows)
-3. Invest in developer tooling
+1. Take your `ci.yml` from Chapter 9 on a new branch.
+2. Add `timeout-minutes`, `concurrency`, `persist-credentials: false`, and the `ci-ok` gate job above.
+3. Open **Settings → Actions → General**: set **Workflow permissions** to *Read repository contents* (read-only), and review **Fork pull request workflows**. In **Settings → Branches/Rulesets**, require only `ci-ok` on `main`.
+4. Prove the injection defense: create a PR titled `x"; echo INJECTED; "` and confirm the log prints it literally. Then temporarily change the workflow to inline the title in the script (`echo "${{ github.event.pull_request.title }}"`), push, observe `INJECTED` executing, and revert. (Do this only in your practice repository.)
+5. Time the pipeline before and after enabling caching or concurrency changes. Write down the numbers.
+6. Add a `CODEOWNERS` entry for `.github/workflows/` (for example `/.github/workflows/ @your-username`).
 
-**Security**:
-1. Minimum permissions, always
-2. Short-lived credentials (OIDC)
-3. Pin and vet all actions
-4. Protect production with approvals
+**Success looks like:** PRs show one required check; the injection demo works only in the unsafe version; baseline and new durations are recorded.
 
-**Architecture**:
-- Monorepo: Great for simplicity, needs careful path filtering
-- Multirepo: Better isolation, needs shared workflow repo
+**If it fails:** the required check is "Expected, waiting" → its name doesn't match the job name; branch protection options differ between classic rules and rulesets.
 
-**Philosophy**: Start simple, add complexity only when needed. Optimize for team velocity and security.
+## 10. Verification checklist (use in reviews)
 
-## Next Chapter
+**Security**
+- [ ] `permissions` declared; minimal scopes
+- [ ] No secrets in `if`, artifacts, caches or logs
+- [ ] Third-party actions pinned; allowed-actions policy set
+- [ ] No `${{ … }}` of untrusted values inside scripts
+- [ ] No `pull_request_target`/`workflow_run` running untrusted code
+- [ ] OIDC instead of static cloud keys; production uses an environment with reviewers
 
-You've learned the principles for building production-grade workflows. Now it's time to **apply everything**. 
+**Performance**
+- [ ] Baseline measured; critical path identified
+- [ ] Independent jobs run in parallel; superseded runs cancelled
+- [ ] Dependencies and image layers cached where measured to help
+- [ ] `timeout-minutes` on every job
 
-Chapters 12-19 form the **Capstone Project**—a comprehensive real-world application demonstrating all concepts from this course. You'll build complete CI/CD automation for a multi-service application, including:
-- Test workflows with caching and parallelization
-- Container image builds with multi-arch support
-- GitOps-based deployments
-- Automated releases with conventional commits
-- Repository automation (stale issues)
-- Performance monitoring
-- All while following best practices for security and maintainability
+**Maintainability**
+- [ ] Standard task names; logic in scripts/Taskfile
+- [ ] Shared steps/jobs in composite actions or reusable workflows with versioned references
+- [ ] A single required gate job
 
-This hands-on project ties together GitHub Actions features, marketplace actions, custom actions, performance optimization, and security practices into a cohesive, production-ready system. Let's build something real.
+## 11. Knowledge check
+
+1. Why can a path-filtered required check block merges forever, and what is the fix?
+2. What is the difference between `pull_request` and `pull_request_target` for a fork PR?
+3. Why might caching make a build slower?
+4. Why is OIDC preferable to a stored access key?
+5. Give two reasons to put a standard task interface in front of every service.
+6. What does `fetch-depth: 0` cost and when is it needed?
+
+<details>
+<summary>Answers</summary>
+
+1. If the workflow is skipped, the required check never reports; use an always-running gate job.
+2. `pull_request`: fork code, read-only token, no secrets. `pull_request_target`: base-branch workflow with secrets; dangerous if it runs PR code.
+3. Restoring a large cache can cost more than rebuilding; a bad key serves stale data.
+4. Short-lived, claim-scoped credentials; nothing long-lived to leak.
+5. Identical commands locally and in CI; reusable, near-identical workflows.
+6. Downloads the full history (slower); needed for changelogs, `git describe`, or version computation.
+</details>
+
+## 12. Key takeaways
+
+- Measure; then wait less, do less, use resources better.
+- Standardize the interface; share via composite actions and reusable workflows.
+- One gate job simplifies required checks.
+- Security baseline: least privilege, OIDC, pinned actions, hostile-input mindset, protected environments.
+- Treat workflow files as production code: review them.
+
+## Sources and further reading
+
+- Original notes: `git show master:11_best_practices.md`. Corrections: invalid `ubuntu-latest-arm` label, a job-level `if` on commit messages mislabeled as a path filter, wording of the fork-PR setting, `curl | sh` in the sample composite action, and a duplicated decision flowchart (see Chapter 8). The reference to "Chapters 12–19" was removed because this guide has Chapters 12–14.
+- Official docs: [Workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax) · [Dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) · [Authenticate with GITHUB_TOKEN](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token) · [Contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts) · [Runner images](https://github.com/actions/runner-images)
+- Not verified here: exact current wording and location of repository settings (fork PR approval, SHA-pinning enforcement), and the `[skip ci]` handling details; confirm in the current docs and your settings UI.

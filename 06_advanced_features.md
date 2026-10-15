@@ -1,1111 +1,465 @@
-# Chapter 6: Advanced Features - Extending Your Workflow Capabilities
+# Chapter 6: Advanced Features: Runners, Artifacts, Caching, Permissions, OIDC, Matrix and Concurrency
 
-## Overview
+> **Level:** intermediate · **Time:** 3–4 hours · **Prerequisites:** [Chapter 5](05_core_features.md)
+> **Next:** [Chapter 7: Marketplace Actions](07_marketplace_actions.md)
 
-You've mastered the core features—events, workflows, jobs, steps, and runners. Now it's time to unlock GitHub Actions' advanced capabilities that will transform your workflows from simple scripts into sophisticated CI/CD systems.
+Chapter 5 gave you the language. This chapter gives you the features that make real pipelines fast, safe and flexible. Each lesson is independent; the lab at the end combines them.
 
-This chapter covers features that **extend your ability to utilize the platform** rather than being essential from the start. While not all are difficult to use, they provide powerful mechanisms for:
+## Learning objectives
 
-- Choosing the right runner infrastructure for performance and cost
-- Persisting data beyond ephemeral job execution
-- Managing permissions and authentication securely
-- Running jobs with multiple configurations simultaneously
-- Controlling workflow execution flow dynamically
+After this chapter you can:
 
-These are **distilled versions** capturing the essence of each feature without getting bogged down in minutiae. You'll see them applied in real-world examples throughout the capstone project later in this course.
+- Choose a runner (GitHub-hosted, larger/third-party hosted, self-hosted) and a container for a job.
+- Pass files between jobs and keep build outputs with **artifacts**.
+- Speed up builds with **caching**, and say how a cache differs from an artifact.
+- Limit the `GITHUB_TOKEN` with `permissions:`.
+- Authenticate to a cloud provider without stored keys, using **OIDC**.
+- Fan a job out across configurations with a **matrix**.
+- Use **concurrency** groups to cancel or serialize runs.
 
-## Runner Types: Choosing Your Execution Environment
+## 1. Problem statement
 
-When we examined the simplest "Hello World" workflow, we still used the `runs-on` field to specify a runner type. Now let's explore the **three categories of runners** available and when to use each.
+Simple workflows run one job on one machine with default settings. Real projects need to: test on several OS/language versions, avoid reinstalling dependencies on every run, hand a built file to a later job, deploy to a cloud without storing a long-lived password, stop two deployments from colliding, and give each workflow only the power it needs. These are the features that do that.
 
-### The Three Runner Categories
+## 2. Core explanation
 
-#### 1. GitHub-Hosted Runners
+### Lesson 6.1: Runners
 
-**What they are**: Virtual machines provided and maintained by GitHub.
+| Kind | Who runs it | Use when |
+|---|---|---|
+| **GitHub-hosted (standard)** | GitHub; fresh VM per job | Default. Zero maintenance. |
+| **Larger / third-party hosted** | GitHub (larger runners, paid) or a vendor selected by label | You need more CPU/RAM, GPUs, faster disks, or cheaper minutes |
+| **Self-hosted** | You | Special hardware, private network access, large caches, or compliance needs |
 
-**Available operating systems**:
-- **Ubuntu**: `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`, `ubuntu-20.04`
-- **Windows**: `windows-latest`, `windows-2022`, `windows-2019`
-- **macOS**: `macos-latest`, `macos-13`, `macos-12`
+#### GitHub-hosted labels
 
-**Specifications** (standard GitHub-hosted):
-- 2-core CPU
-- 7 GB RAM
-- 14 GB SSD disk space
-- Pre-installed software (Docker, Node.js, Python, Go, Java, etc.)
+Pick an explicit image rather than relying on `-latest` when reproducibility matters. As of this writing, labels documented for standard hosted runners include:
 
-**When to use**:
-- Public repositories (free unlimited minutes)
-- Standard build requirements
-- No special infrastructure needs
-- Quick setup without configuration
+| OS | Labels |
+|---|---|
+| Linux (x64) | `ubuntu-24.04`, `ubuntu-22.04`, `ubuntu-latest` (an alias that GitHub repoints over time) |
+| Linux (Arm64) | `ubuntu-24.04-arm` |
+| Windows | `windows-2025`, `windows-2022`, `windows-latest` |
+| Windows (Arm64) | `windows-11-arm` |
+| macOS | `macos-15`, `macos-latest` (and others listed in the docs) |
 
-**Pricing**:
-- **Public repos**: Free
-- **Private repos**: Included minutes vary by plan, then $0.008/minute (Linux), $0.016/minute (Windows), $0.08/minute (macOS)
+Labels are retired and added regularly. Names such as `ubuntu-20.04` and `macos-12` have been removed, and `ubuntu-latest-arm` is **not** a valid label (use `ubuntu-24.04-arm`). **Always check the [runner images list](https://github.com/actions/runner-images) before using a label.** Hardware specifications, included minutes, per-minute prices and retention periods differ by plan, repository visibility and date, so look them up in GitHub's current billing documentation rather than copying numbers from notes.
 
-**Example**:
+#### Self-hosted runners
+
+You install the runner agent on your own machine and register it with a label, then target it with `runs-on: [self-hosted, linux, x64]` (or your own labels). Benefits: access to private networks, custom hardware, persistent caches. Costs: you patch it, secure it, and clean it. **Do not use self-hosted runners on public repositories** unless you fully understand the risk: a pull request from a fork can run arbitrary code on your machine. Prefer ephemeral (one-job) runners and isolated networks.
+
+#### Running a job inside a container
+
 ```yaml
 jobs:
   test:
-    runs-on: ubuntu-24.04  # GitHub-hosted Ubuntu
-```
-
-#### 2. Third-Party Hosted Runners
-
-**What they are**: Runners provided by companies like **Namespace**, offering GitHub Actions-compatible infrastructure.
-
-**Why use them**:
-- **Performance**: Significantly faster compute and storage
-- **Cost**: Often half the price of GitHub-hosted runners
-- **Features**: Advanced caching, better observability, improved multi-architecture builds
-- **Speed**: Faster startup times and network performance
-
-**Namespace example specifications**:
-- Customizable CPU and memory (e.g., 4-core, 16 GB)
-- Fast SSD storage
-- ARM64 and x86-64 architectures
-- Custom VM images with pre-installed dependencies
-
-**Example**:
-```yaml
-jobs:
-  build:
-    runs-on: namespace-profile-default  # Third-party runner
-```
-
-**Or with custom configuration**:
-```yaml
-jobs:
-  build:
-    runs-on:
-      - namespace-profile-my-custom-image
-      - nscloud-cpu-4-x64  # 4 CPU cores, x86-64
-      - nscloud-ram-16-x64  # 16 GB RAM
-```
-
-**Performance comparison**: According to benchmarks by runs-on across providers:
-- **Namespace**: Fastest x86-64 runners, 50% cost of GitHub-hosted
-- **GitHub-hosted**: Standard performance, predictable but slower
-- **Self-hosted (via runs-on)**: Cost-effective at scale
-
-**Additional benefits**:
-- **Observability**: CPU, memory, network, storage metrics for each job
-- **Insights dashboard**: Execution timing trends over time
-- **Filtering**: Drill down to specific jobs and view performance data
-- **Logs retention**: Access logs from completed runners
-
-#### 3. Self-Hosted Runners
-
-**What they are**: Runners you install and maintain on your own infrastructure.
-
-**The runner agent**: Open-source project you can install on:
-- Physical servers in your data center
-- VMs in your private cloud
-- Kubernetes clusters (using Actions Runner Controller/ARC)
-- On-demand cloud instances (using tools like runs-on)
-
-**Runs-on project**: Deploys infrastructure into your AWS account that spins up on-demand EC2 instances for each runner job. Benefits:
-- Reduces costs significantly (pay only for execution time)
-- Keeps data within your VPC (compliance/security)
-- Automatic scaling based on demand
-
-**When to use**:
-- Need access to internal resources (databases, private networks)
-- Compliance requirements (data sovereignty)
-- Very high build volumes (cost optimization)
-- Custom hardware requirements (GPUs, specific CPU architectures)
-
-**Example**:
-```yaml
-jobs:
-  build:
-    runs-on: my-self-hosted-runner-name
-```
-
-**Or with labels**:
-```yaml
-jobs:
-  build:
-    runs-on: [self-hosted, linux, x64, gpu]
-```
-
-### Running Jobs Inside Containers
-
-Beyond choosing a runner type, you can **execute jobs within container images** for even more control over dependencies.
-
-**Syntax**:
-```yaml
-jobs:
-  test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
-      image: alpine:latest
-```
-
-**What happens**:
-1. GitHub allocates the specified runner (Ubuntu)
-2. Runner pulls the container image (Alpine)
-3. All steps execute inside the container
-4. Container provides additional dependencies not in base image
-
-**Use cases**:
-- Specific language versions not pre-installed
-- Custom toolchains or build environments
-- Isolation between jobs
-- Reproducibility (same container = same environment)
-
-**Complete example**:
-```yaml
-jobs:
-  alpine-test:
-    runs-on: ubuntu-latest
-    container:
-      image: alpine:3.18
+      image: node:22-bookworm
     steps:
-      - run: uname -a  # Shows Alpine kernel info
-      - run: cat /etc/os-release  # Shows Alpine OS
+      - uses: actions/checkout@v5
+      - run: node --version && npm ci && npm test
 ```
 
-### Practical Example: Multiple Runner Types
+The steps run inside the container on the runner. `services:` starts sidecar containers (for example PostgreSQL) reachable by their service name when the job itself runs in a container, or on `localhost` with mapped ports when it does not.
+
+**Rule:** choose `runs-on` deliberately; use containers when you need an exact toolchain; keep self-hosted runners away from untrusted code.
+
+### Lesson 6.2: Artifacts: files that outlive a job
+
+An **artifact** is a file or folder you upload from a run so that (a) later jobs in the same run can download it, and (b) people can download it from the run page.
 
 ```yaml
-name: Runner Types
-
-on: workflow_dispatch
-
 jobs:
-  github-ubuntu:
+  build:
     runs-on: ubuntu-24.04
     steps:
-      - run: |
-          echo "Runner: $(uname -s) $(uname -m)"
-          echo "OS: $(cat /etc/os-release | grep PRETTY_NAME)"
+      - uses: actions/checkout@v5
+      - run: mkdir -p dist && date > dist/build-info.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: dist/
+          retention-days: 7        # optional; shorter is cheaper and safer
+          if-no-files-found: error
 
-  github-windows:
-    runs-on: windows-latest
+  use:
+    needs: build
+    runs-on: ubuntu-24.04
     steps:
-      - run: |
-          echo "Runner: Windows"
-          systeminfo | findstr /C:"OS Name"
-
-  github-macos:
-    runs-on: macos-latest
-    steps:
-      - run: |
-          echo "Runner: $(uname -s) $(uname -m)"
-          sw_vers
-
-  container-alpine:
-    runs-on: ubuntu-latest
-    container: alpine:latest
-    steps:
-      - run: |
-          echo "Container: Alpine Linux"
-          cat /etc/os-release
-
-  namespace-runner:
-    runs-on: namespace-profile-default
-    steps:
-      - run: |
-          echo "Third-party runner"
-          echo "Runner type: NSC (Namespace Cloud)"
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: dist/
+      - run: cat dist/build-info.txt
 ```
 
-**Execution characteristics**:
-- All jobs run **in parallel** (no dependencies)
-- Each gets its own isolated runner
-- GitHub-hosted jobs complete in 10-30 seconds
-- Namespace job often faster due to optimized infrastructure
+Important facts:
 
-## Artifacts: Persisting Data Beyond Job Lifecycle
+- Use **v4** (or newer) of both actions. Version 3 stopped working in January 2025 after GitHub deprecated it ([deprecation notice](https://github.blog/changelog/2024-04-16-deprecation-notice-v3-of-the-artifact-actions/)); workflows still pinned to `@v3` fail.
+- In v4, an artifact **name must be unique within a run**. In a matrix, include the matrix value in the name (`name: build-${{ matrix.os }}`), or upload from the matrix jobs and merge afterwards.
+- Artifacts are zipped; permissions of files may be lost. Do not upload secrets or `.env` files. Anyone who can read the run can download them; for public repositories that means everyone.
+- `if: always()` on the upload step keeps logs and test reports from failed runs.
 
-By default, jobs run in **ephemeral environments**—created at job start, destroyed at job end. Artifacts provide a mechanism to **persist data beyond that lifecycle**.
+### Lesson 6.3: Caching: reuse work between runs
 
-### What Are Artifacts?
+A **cache** stores files (typically dependencies) under a **key** and restores them on a later run if the key matches. Unlike artifacts, a cache is a speed optimization: a build must still work when the cache is empty.
 
-**Definition**: Files or directories uploaded to GitHub's storage that persist after workflow completion.
+| | Artifact | Cache |
+|---|---|---|
+| Purpose | Deliver outputs (binaries, reports) | Avoid recomputing inputs (dependencies) |
+| Scope | One run (and downloadable by humans) | Across runs, per repository and branch rules |
+| If missing | The workflow is broken | The workflow is just slower |
+| Typical content | `dist/`, test reports | `~/.npm`, `~/.cache/pip`, Go module cache |
 
-**Retention**:
-- Default: 90 days (configurable per repository)
-- Maximum: 400 days
-- Public repos: Free storage
-- Private repos: Counts against storage quota
+The easy path is to let the setup action manage it:
 
-**Common use cases**:
-- Build outputs (compiled binaries, Docker images metadata)
-- Test results and coverage reports
-- Log files for debugging
-- Documentation generated during build
-
-### Uploading Artifacts
-
-**Action**: `actions/upload-artifact@v3`
-
-**Basic syntax**:
 ```yaml
-- uses: actions/upload-artifact@v3
+- uses: actions/setup-node@v4
   with:
-    name: my-artifact  # Name shown in UI
-    path: path/to/file.txt  # File or directory to upload
+    node-version: 22
+    cache: npm            # keyed on package-lock.json automatically
 ```
 
-**Multiple files/patterns**:
+The explicit form uses `actions/cache@v4`:
+
 ```yaml
-- uses: actions/upload-artifact@v3
+- uses: actions/cache@v4
   with:
-    name: test-results
-    path: |
-      test-results/**/*.xml
-      coverage/**/*.html
-      logs/*.log
+    path: ~/.npm
+    key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      npm-${{ runner.os }}-
 ```
 
-### Downloading Artifacts
+**Keys.** The key should change exactly when the cached content should be rebuilt: include the OS and a hash of the lock file. An exact `key` hit restores the cache; otherwise the first matching `restore-keys` prefix restores a *near* cache, and a new cache is saved at the end of a successful job under the exact key. Caches are immutable: a given key is written once.
 
-**Action**: `actions/download-artifact@v3`
+**Limits and behavior** (check the [dependency caching docs](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) for current values): there is a per-repository storage limit (10 GB by default, which owners can raise with billing above that), and entries not accessed for 7 days are removed. When the limit is exceeded, the oldest entries are evicted. Caches are also scoped by branch: a feature branch can read the default branch's caches, but not vice versa.
 
-**Basic syntax**:
-```yaml
-- uses: actions/download-artifact@v3
-  with:
-    name: my-artifact  # Must match upload name
-```
+**Security.** Never put secrets in a cache. Because caches can be restored in later runs, a poisoned cache can affect later builds; treat caches from untrusted pull requests with care (see Chapter 11).
 
-**Where it downloads**: Current working directory by default.
+### Lesson 6.4: Permissions: least privilege for `GITHUB_TOKEN`
 
-**Custom path**:
-```yaml
-- uses: actions/download-artifact@v3
-  with:
-    name: my-artifact
-    path: ./downloaded-artifacts/
-```
-
-### Complete Example: Producer-Consumer Pattern
+Every run gets a temporary token, `GITHUB_TOKEN`, that actions and `gh` use to call the GitHub API. Its power is set by the `permissions:` key. If you omit the key, the token receives the **repository's or organization's default** (permissive or read-only, depending on a setting that varies by account and age of the repository). Do not depend on the default: declare what you need.
 
 ```yaml
-name: Artifacts
-
-on: workflow_dispatch
+permissions:            # workflow level: applies to all jobs
+  contents: read
 
 jobs:
-  producer:
-    runs-on: ubuntu-latest
+  comment:
+    runs-on: ubuntu-24.04
+    permissions:        # job level: overrides the workflow level for this job
+      contents: read
+      pull-requests: write
     steps:
-      - name: Create artifact
-        run: |
-          mkdir -p output
-          echo "Hello from producer job at $(date)" > output/artifact.txt
-          echo "Build ID: ${{ github.run_id }}" >> output/artifact.txt
-      
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: my-artifact
-          path: output/artifact.txt
-
-  consumer:
-    needs: producer  # Wait for producer to finish
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: my-artifact
-      
-      - name: Display artifact contents
-        run: cat artifact.txt
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Thanks for the PR!"
 ```
 
-**Execution flow**:
-1. **Producer** creates `artifact.txt` with timestamp
-2. **Producer** uploads file to GitHub's artifact storage
-3. **Consumer** waits for producer to complete (via `needs`)
-4. **Consumer** downloads artifact from storage
-5. **Consumer** displays contents (same data from producer)
+| Scope (selected) | `read` allows | `write` allows |
+|---|---|---|
+| `contents` | Checkout, read repository | Push commits/tags, create releases |
+| `pull-requests` | Read PRs | Comment, label, review |
+| `issues` | Read issues | Comment, label, close |
+| `packages` | Pull from GitHub Packages / GHCR | Push images and packages |
+| `id-token` | n/a | Request an OIDC token (next lesson) |
+| `actions`, `checks`, `deployments`, `statuses`, `security-events`, ... | See the [token docs](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token) | |
 
-**In GitHub UI**:
-- Go to workflow run summary page
-- See "Artifacts" section at bottom
-- Download as ZIP file
-- Persists for 90 days (or your configured retention)
+Values are `read`, `write` or `none`. Setting any scope in `permissions:` sets every **unlisted** scope to `none`. `permissions: {}` removes all permissions.
 
-## Caching: Avoiding Repetitive Work
+Also note: events from forked pull requests get a read-only token regardless of what you request, and commits or tags pushed *using* `GITHUB_TOKEN` do not start new workflow runs (a deliberate guard against loops). If you need the push to trigger a workflow, use a GitHub App token or a deploy key, deliberately.
 
-Similar to artifacts, but serving a different purpose: **caching** optimizes workflows by storing frequently-used dependencies that don't change often.
+**Rule:** start every workflow with `permissions: contents: read`, then grant extra scopes per job.
 
-### When to Use Caching
+### Lesson 6.5: Authenticating to cloud systems: secrets versus OIDC
 
-**Problem**: Jobs are ephemeral. If you need to install dependencies, you do it **every single run**.
+Two ways for a workflow to prove itself to AWS, Google Cloud, Azure, Vault and others:
 
-**Example without caching**:
-```
-Run 1: Download Node.js modules (45 seconds)
-Run 2: Download Node.js modules (45 seconds)  ← Repetitive!
-Run 3: Download Node.js modules (45 seconds)  ← Repetitive!
-```
+| | Stored credentials | OIDC (OpenID Connect) |
+|---|---|---|
+| How | You create an access key and store it as a secret | GitHub issues a short-lived signed token per job; the cloud exchanges it for temporary credentials |
+| Lifetime | Until you rotate it | Minutes |
+| Leak impact | Anyone with the key can use it anywhere | The token is useless outside the run, and the cloud trust policy limits who can mint it |
+| Setup | Easy | One-time trust configuration on the cloud side |
 
-**Solution**: Cache dependencies after first run, restore them in subsequent runs.
-
-```
-Run 1: Download Node.js modules (45 seconds) → Cache them
-Run 2: Restore from cache (3 seconds)  ← 15x faster!
-Run 3: Restore from cache (3 seconds)  ← 15x faster!
-```
-
-### GitHub's Official Cache Action
-
-**Action**: `actions/cache@v3`
-
-**How it works**:
-1. Specify **paths** to cache (directories or files)
-2. Specify **cache key** (unique identifier)
-3. First run: Cache miss → Populate cache
-4. Subsequent runs: Cache hit → Restore from cache
-
-**Basic syntax**:
-```yaml
-- uses: actions/cache@v3
-  with:
-    path: ~/.npm  # Directory to cache
-    key: npm-${{ hashFiles('package-lock.json') }}  # Unique key
-```
-
-### Cache Keys: The Critical Detail
-
-**Cache key determines**: When to invalidate and regenerate cache.
-
-**Best practice**: Include hash of dependency lock file.
-
-**Examples**:
-- Node.js: `npm-${{ hashFiles('package-lock.json') }}`
-- Python: `pip-${{ hashFiles('requirements.txt') }}`
-- Go: `go-${{ hashFiles('go.sum') }}`
-
-**Why this works**:
-- Lock file changes → Hash changes → New cache key → Cache miss → Re-download dependencies
-- Lock file unchanged → Same hash → Same cache key → Cache hit → Restore quickly
-
-### Complete Caching Example
+With OIDC, the cloud provider is configured to trust tokens issued by GitHub **for specific claims**: which repository, branch, environment, or workflow. The job must have `id-token: write`.
 
 ```yaml
-name: Caching Example
-
-on: workflow_dispatch
+permissions:
+  id-token: write      # allow requesting the OIDC token
+  contents: read
 
 jobs:
-  cache-demo:
-    runs-on: ubuntu-latest
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Restore cache
-        id: restore-cache
-        uses: actions/cache@v3
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          path: /tmp/my-cache
-          key: my-cache-key-v1
-      
-      - name: Check cache status
-        run: |
-          if [ "${{ steps.restore-cache.outputs.cache-hit }}" == "true" ]; then
-            echo "Cache HIT - file exists!"
-          else
-            echo "Cache MISS - need to generate file"
-          fi
-      
-      - name: Generate file (only on cache miss)
-        if: steps.restore-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/my-cache
-          echo "Generated at $(date)" > /tmp/my-cache/data.txt
-      
-      - name: Display cached file
-        run: cat /tmp/my-cache/data.txt
+          role-to-assume: arn:aws:iam::123456789012:role/github-deploy   # example ARN
+          aws-region: us-east-1
+      - run: aws sts get-caller-identity
 ```
 
-**First execution**:
-- `cache-hit` output: `false`
-- Executes generation step
-- Automatically uploads `/tmp/my-cache` to cache storage
+The AWS-side trust policy must restrict the token's `sub` claim (for example to `repo:YOUR-ORG/YOUR-REPO:environment:production`). **A trust policy that allows any repository is a serious vulnerability.** The same pattern exists for GCP (`google-github-actions/auth`) and Azure (`azure/login`). Follow your provider's current OIDC guide for setup, and verify the exact `sub` format in GitHub's [OIDC reference](https://docs.github.com/en/actions/concepts/security/openid-connect).
 
-**Second execution**:
-- `cache-hit` output: `true`
-- Skips generation step (conditional)
-- File already exists from cache restore
+### Lesson 6.6: Matrix strategies
 
-### Language-Specific Caching
+A **matrix** creates one job per combination of values.
 
-Most setup actions include built-in caching support.
-
-#### Node.js Example
-
-```yaml
-- uses: actions/setup-node@v3
-  with:
-    node-version: '18'
-    cache: 'npm'  # Enables npm caching
-    cache-dependency-path: 'package-lock.json'
-
-- run: npm install  # Automatically uses cache
-```
-
-**How it works**:
-- Action generates cache key from `package-lock.json` hash
-- Restores `node_modules/` if cache hit
-- `npm install` skips already-installed packages
-- Significant speed improvement on cache hits
-
-#### Go Example
-
-```yaml
-- uses: actions/setup-go@v4
-  with:
-    go-version: '1.21'
-    cache: true  # Enables Go module caching
-
-- run: go build ./...
-```
-
-#### Python Example
-
-```yaml
-- uses: actions/setup-python@v4
-  with:
-    python-version: '3.11'
-    cache: 'pip'
-    cache-dependency-path: 'requirements.txt'
-
-- run: pip install -r requirements.txt
-```
-
-### GitHub Cache Limits
-
-**Storage limit**: 10 GB per repository
-
-**Eviction policy**: When limit exceeded, GitHub evicts **least recently used (LRU)** cache entries.
-
-**Result**: Rolling 10 GB window of your most recent caches.
-
-**Best practices**:
-- Cache only what you need
-- Use specific cache keys (avoid caching everything with one key)
-- Consider cache size when deciding what to cache
-
-### Namespace Cache Volumes: A Different Approach
-
-While GitHub uses **object storage** (upload/download model), Namespace uses **volume snapshots** (mount model).
-
-**How Namespace caching works**:
-1. Specify a cache volume size and identifier
-2. Volume mounts at job start (like a disk drive)
-3. Read/write directly to volume during job
-4. Volume snapshots automatically at job end
-5. Next job mounts snapshot copy (instant access)
-
-**Advantages**:
-- **No upload/download time** (volume is already there)
-- **Much faster** for large datasets or many small files
-- **Simpler workflow** (no explicit save/restore steps)
-
-**Trade-offs**:
-- **Less deterministic** (snapshots may not be from exact cache key)
-- **Good enough** for most use cases (dependencies rarely need exact matching)
-
-**Example**:
 ```yaml
 jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false            # let other legs finish if one fails
+      max-parallel: 4             # optional throttle
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+        node: [20, 22]
+        exclude:
+          - os: windows-2022
+            node: 20
+        include:
+          - os: ubuntu-24.04
+            node: 24
+            experimental: true
+    continue-on-error: ${{ matrix.experimental == true }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci && npm test
+```
+
+Combinations here: 2×2 = 4, minus the excluded one = 3, plus the included extra = 4 jobs. `exclude` removes combinations from the generated set; `include` adds new legs (or extra properties to existing ones). Defaults: `fail-fast: true` cancels the remaining legs as soon as one fails, which is often not what you want for compatibility testing. A matrix is limited to 256 jobs per workflow run.
+
+**Dynamic matrix.** A matrix can be built from JSON produced by an earlier job, which is the key to the monorepo capstone:
+
+```yaml
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      services: ${{ steps.p.outputs.services }}
+    steps:
+      - id: p
+        run: echo 'services=["api","web"]' >> "$GITHUB_OUTPUT"
   build:
-    runs-on:
-      - namespace-profile-default
-      - nscloud-cache-size-20gb
-      - nscloud-cache-tag-node-modules
+    needs: plan
+    if: ${{ needs.plan.outputs.services != '[]' }}     # an empty matrix is an error
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.plan.outputs.services) }}
     steps:
-      - uses: namespacelabs/nscloud-cache-action@v1
-        with:
-          path: /home/runner/.npm
-      
-      - run: npm install  # Uses cached /home/runner/.npm
+      - run: echo "building ${{ matrix.service }}"
 ```
 
-**Performance comparison** (from benchmark):
-- **Single large file**: 
-  - GitHub cache: 28 seconds
-  - Namespace cache: 3 seconds (9x faster)
-- **100,000 small files**:
-  - GitHub cache: 72 seconds
-  - Namespace cache: 4 seconds (18x faster)
+An empty array makes the workflow fail ("Matrix vector does not contain any values"), so guard it with `if:`.
 
-**When cache misses occur**: Just slower execution, not a failure. The penalty is minimal compared to consistent speedups.
+### Lesson 6.7: Conditionals recap
 
-## Permissions: Controlling GitHub API Access
+`if:` works on steps and jobs (Lesson 5.8). Remember the contexts that exist in each place, and that `needs`-dependent jobs are skipped when a dependency fails unless you add `if: ${{ !cancelled() }}` or `always()`. Typical uses:
 
-Workflows can interact with GitHub's API to:
-- Read repository contents
-- Create issues and PRs
-- Add labels and comments
-- Publish packages
-- Manage releases
-
-**By default**, workflows have **limited permissions**. You must explicitly grant additional access.
-
-### Default Permissions
-
-**Contents**: `read` (can clone repository code)  
-**Packages**: `read` (can pull from GitHub Package Registry)
-
-**Everything else**: `none`
-
-### Available Permission Scopes
-
-| Scope | Purpose | Actions |
-|-------|---------|---------|
-| `contents` | Repository code and releases | Clone, create releases |
-| `issues` | Issue management | Create, edit, label issues |
-| `pull-requests` | PR management | Create, edit, label PRs |
-| `packages` | Package registry | Push/pull packages |
-| `deployments` | Deployment tracking | Create deployment statuses |
-| `actions` | Workflow management | Cancel runs, approve runs |
-| `checks` | Check runs | Create check runs |
-| `statuses` | Commit statuses | Set commit status |
-
-**Full list**: https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token
-
-### Permission Levels
-
-- **`read`**: Query/view data
-- **`write`**: Create/modify data
-- **`none`**: No access (default for most scopes)
-
-### Specifying Permissions
-
-**Workflow level** (applies to all jobs):
 ```yaml
-name: My Workflow
+deploy:
+  needs: [test]
+  if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+```
+
+### Lesson 6.8: Concurrency
+
+`concurrency` makes runs that share a **group** string take turns.
+
+```yaml
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true         # newer run cancels the older one
+```
+
+| Pattern | Config | Why |
+|---|---|---|
+| Cancel superseded CI | `cancel-in-progress: true`, group per branch/PR | Don't waste minutes on outdated commits |
+| Serialize deployments | `group: deploy-production`, `cancel-in-progress: false` | Never overlap two deploys; later runs wait (only one run waits; extra pending runs are replaced) |
+| Per-environment | `group: deploy-${{ inputs.environment }}` | Staging and production don't block each other |
+
+Do **not** cancel a deployment mid-flight unless you know it is safe. Concurrency can be set at workflow or job level.
+
+## 3. Mental model
+
+- **Runner** = which kitchen. **Container** = which toolbox on the bench.
+- **Artifact** = a sealed parcel mailed to the next cook (or the customer). **Cache** = a pantry shelf of ingredients: nice to have, rebuildable.
+- **Permissions** = the key-ring you hand the cook; **OIDC** = a one-day visitor badge instead of a master key.
+- **Matrix** = photocopying the recipe for each oven type. **Concurrency** = a single-lane bridge sign.
+
+## 4. Syntax breakdown
+
+| Key | Where | Meaning |
+|---|---|---|
+| `runs-on` | job | Runner label(s) |
+| `container` / `services` | job | Job container / sidecar containers |
+| `permissions` | workflow or job | Token scopes |
+| `strategy.matrix`, `fail-fast`, `max-parallel` | job | Fan-out controls |
+| `concurrency.group`, `cancel-in-progress` | workflow or job | Serialization |
+| `uses: actions/upload-artifact@v4` / `download-artifact@v4` | step | Files between jobs |
+| `uses: actions/cache@v4` | step | Cache restore/save |
+| `id-token: write` | `permissions` | Allows OIDC token request |
+
+## 5. Practical example
+
+`.github/workflows/advanced-lab.yml`:
+
+```yaml
+name: Advanced Lab
+
+on:
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
 
-jobs:
-  # All jobs have these permissions
-```
+concurrency:
+  group: advanced-lab-${{ github.ref }}
+  cancel-in-progress: true
 
-**Job level** (overrides workflow permissions):
-```yaml
-jobs:
-  deploy:
-    permissions:
-      contents: write  # This job needs write access
-      packages: write
-```
-
-**Step level**: Not supported (permissions apply at job level).
-
-### Practical Example: PR Automation
-
-```yaml
-name: Permissions Example
-
-on: workflow_dispatch
-
-jobs:
-  readonly-pr:
-    permissions:
-      pull-requests: read  # Can only READ PRs
-    runs-on: ubuntu-latest
-    steps:
-      - name: List PRs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr list --repo ${{ github.repository }}
-      
-      - name: Try to add label (WILL FAIL)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUMBER=$(gh pr list --json number --jq '.[0].number')
-          gh pr edit $PR_NUMBER --add-label "documentation"
-
-  readwrite-pr:
-    permissions:
-      pull-requests: write  # Can READ and WRITE PRs
-    runs-on: ubuntu-latest
-    steps:
-      - name: List PRs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr list --repo ${{ github.repository }}
-      
-      - name: Add label (WILL SUCCEED)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUMBER=$(gh pr list --json number --jq '.[0].number')
-          gh pr edit $PR_NUMBER --add-label "documentation"
-```
-
-**Execution results**:
-- **First job**: Lists PRs successfully, but fails when trying to add label (403 Forbidden)
-- **Second job**: Lists PRs successfully AND adds label successfully
-
-**The `GITHUB_TOKEN`**: Automatically created secret providing API authentication with specified permissions.
-
-### Best Practice: Principle of Least Privilege
-
-**Always use minimum permissions required**:
-- Most workflows: `contents: read`
-- Publishing packages: Add `packages: write`
-- Interacting with PRs/issues: Add `pull-requests: write` or `issues: write`
-
-**Why this matters**: Compromised workflows (supply chain attacks, malicious PRs) have limited blast radius.
-
-## Authentication to Third-Party Systems
-
-Workflows often need to interact with external services: AWS, Azure, GCP, Docker Hub, etc. Two methods exist for authentication.
-
-### Method 1: Static Credentials (API Keys)
-
-**What they are**: Long-lived credentials stored as GitHub secrets.
-
-**Characteristics**:
-- **Security**: Less secure (credentials live indefinitely)
-- **Compatibility**: Works with every service
-- **Rotation**: Manual process
-- **Risk**: If leaked, valid until rotated
-
-**Setup process**:
-1. Generate API key in third-party service
-2. Add as GitHub Actions secret
-3. Reference secret in workflow
-
-**Example - AWS static credentials**:
-
-**In AWS Console**:
-1. IAM → Users → Create user
-2. Generate access key
-3. Save access key ID and secret access key
-
-**In GitHub**:
-1. Settings → Secrets and variables → Actions
-2. New repository secret: `AWS_ACCESS_KEY_ID`
-3. New repository secret: `AWS_SECRET_ACCESS_KEY`
-
-**In workflow**:
-```yaml
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-      
-      - run: aws s3 ls  # Authenticated!
-```
-
-### Method 2: OIDC Tokens (Recommended)
-
-**What they are**: Short-lived credentials generated at runtime via OpenID Connect (OIDC).
-
-**Characteristics**:
-- **Security**: More secure (tokens expire quickly)
-- **Compatibility**: Requires OIDC support in service
-- **Rotation**: Automatic (new token each run)
-- **Risk**: If leaked, expires in minutes
-
-**How it works**:
-1. GitHub generates JWT (JSON Web Token) signed by GitHub
-2. Workflow presents JWT to third-party service
-3. Service validates JWT signature with GitHub's public keys
-4. Service issues short-lived credentials
-5. Workflow uses credentials
-6. Credentials expire after job completes
-
-**Supported services**:
-- AWS (via IAM role assumption)
-- Azure (via workload identity federation)
-- GCP (via workload identity federation)
-- HashiCorp Vault
-- Many others
-
-### OIDC with AWS: Complete Setup
-
-**Step 1: Add OIDC provider in AWS IAM**
-
-1. IAM → Identity providers → Add provider
-2. Provider type: OpenID Connect
-3. Provider URL: `https://token.actions.githubusercontent.com`
-4. Audience: `sts.amazonaws.com`
-5. Click "Add provider"
-
-**Step 2: Create IAM role with trust policy**
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:YOUR_ORG/YOUR_REPO:*"
-        }
-      }
-    }
-  ]
-}
-```
-
-**What this trust policy does**:
-- Allows GitHub Actions to assume this role
-- **Only** from specified repository
-- Only when audience matches
-- Prevents other repos from assuming your role
-
-**Step 3: Use in workflow**
-
-```yaml
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write  # REQUIRED for OIDC
-      contents: read
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v2
-        with:
-          role-to-assume: arn:aws:iam::ACCOUNT_ID:role/GitHubActionsRole
-          aws-region: us-east-1
-      
-      - run: aws sts get-caller-identity  # Verify authentication
-      - run: aws s3 ls  # Perform actual work
-```
-
-**Critical detail**: `id-token: write` permission is **required**. Without it, workflow cannot request JWT from GitHub.
-
-**Security benefits**:
-- No long-lived credentials to leak
-- Scoped to specific repository
-- Automatic expiration
-- Audit trail via CloudTrail
-
-## Matrix Strategies: Run Jobs with Multiple Configurations
-
-Often you need to test code across multiple environments:
-- Different OS versions (Ubuntu 20.04, 22.04, 24.04)
-- Different language versions (Node 16, 18, 20)
-- Different database versions (PostgreSQL 13, 14, 15)
-
-**Matrix strategies** let you define configurations once and run jobs for all combinations.
-
-### Basic Matrix Syntax
-
-```yaml
-jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        node: [16, 18, 20]
-    
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/setup-node@v3
-        with:
-          node-version: ${{ matrix.node }}
-      - run: npm test
-```
-
-**What happens**: GitHub creates **9 jobs** (3 OS × 3 Node versions):
-1. ubuntu-latest + Node 16
-2. ubuntu-latest + Node 18
-3. ubuntu-latest + Node 20
-4. windows-latest + Node 16
-5. windows-latest + Node 18
-6. windows-latest + Node 20
-7. macos-latest + Node 16
-8. macos-latest + Node 18
-9. macos-latest + Node 20
-
-All jobs run **in parallel** (subject to runner availability).
-
-### Excluding Combinations
-
-**Problem**: Sometimes certain combinations don't make sense or are known to fail.
-
-**Solution**: Use `exclude` to skip specific combinations.
-
-```yaml
-strategy:
-  matrix:
-    os: [ubuntu-latest, windows-latest]
-    node: [16, 18, 20]
-    exclude:
-      - os: windows-latest
-        node: 16  # Skip Windows + Node 16
-```
-
-**Result**: 5 jobs instead of 6 (all except Windows + Node 16).
-
-### Including Additional Combinations
-
-**Use case**: Add one specific configuration not covered by matrix.
-
-```yaml
-strategy:
-  matrix:
-    os: [ubuntu-latest]
-    node: [18, 20]
-    include:
-      - os: macos-latest  # Add one macOS job
-        node: 18
-```
-
-**Result**: 3 jobs (ubuntu+18, ubuntu+20, macos+18).
-
-### Practical Matrix Example
-
-```yaml
-name: Matrix and Conditionals
-
-on: workflow_dispatch
-
-jobs:
-  matrix-job:
-    strategy:
-      matrix:
-        number: [1, 2]
-        letter: ['a', 'b', 'c']
-        exclude:
-          - number: 1
-            letter: 'c'  # Skip 1-c combination
-    
-    runs-on: ubuntu-latest
-    steps:
-      - name: Step 1
-        run: echo "Number=${{ matrix.number }}, Letter=${{ matrix.letter }}"
-      
-      - name: Step 2 (conditional)
-        if: matrix.number == 2 && matrix.letter == 'c'
-        run: echo "This only runs for 2-c combination"
-```
-
-**Execution**:
-- **5 jobs created**: 1-a, 1-b, 2-a, 2-b, 2-c (1-c excluded)
-- **All run in parallel**
-- **In 2-c job**: Step 2 executes
-- **In other jobs**: Step 2 skipped
-
-## Conditionals: Dynamic Execution Control
-
-Conditionals allow steps or jobs to run only when certain conditions are met.
-
-### Step-Level Conditionals
-
-**Syntax**:
-```yaml
-- name: Conditional step
-  if: <expression>
-  run: echo "This runs conditionally"
-```
-
-**Common expressions**:
-
-**Check job status**:
-```yaml
-if: success()  # Previous steps succeeded
-if: failure()  # Previous step failed
-if: always()   # Run regardless of status
-```
-
-**Check variables**:
-```yaml
-if: github.ref == 'refs/heads/main'  # Only on main branch
-if: github.event_name == 'pull_request'  # Only for PRs
-if: matrix.os == 'ubuntu-latest'  # Matrix value check
-```
-
-**Check secrets/variables**:
-```yaml
-if: secrets.DEPLOY_KEY != ''  # Secret is set
-```
-
-**Combine conditions**:
-```yaml
-if: github.ref == 'refs/heads/main' && success()
-if: failure() || cancelled()
-```
-
-### Job-Level Conditionals
-
-Same syntax at job level:
-
-```yaml
-jobs:
-  deploy-staging:
-    if: github.ref == 'refs/heads/develop'
-    # Only runs when pushing to develop branch
-
-  deploy-production:
-    if: github.ref == 'refs/heads/main'
-    # Only runs when pushing to main branch
-```
-
-### Practical Example
-
-```yaml
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v3
-      - run: npm run build
-      - run: npm test
-  
-  deploy:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: .cache-demo
+          key: demo-${{ runner.os }}-${{ hashFiles('.github/workflows/advanced-lab.yml') }}
+      - name: Build (slow only on a cache miss)
+        run: |
+          if [ ! -f .cache-demo/ready ]; then
+            echo "cache miss: doing slow work"
+            sleep 15
+            mkdir -p .cache-demo && touch .cache-demo/ready
+          else
+            echo "cache hit: skipping slow work"
+          fi
+          mkdir -p dist && echo "built at $(date -u)" > dist/info.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  test:
     needs: build
-    if: github.ref == 'refs/heads/main' && success()
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Deploying to production..."
-```
-
-**Logic**:
-- Build job: Always runs
-- Deploy job: Only if build succeeds AND on main branch
-
-## Concurrency: Controlling Multiple Workflow Runs
-
-**Problem**: Multiple commits pushed quickly trigger multiple workflow runs. Often, only the latest run matters.
-
-**Example scenario**:
-```
-Commit A pushed → Workflow run #1 starts (takes 5 minutes)
-Commit B pushed → Workflow run #2 starts (takes 5 minutes)
-Commit C pushed → Workflow run #3 starts (takes 5 minutes)
-```
-
-Without concurrency control, all three run in parallel, wasting resources. Run #1 and #2 are obsolete the moment #3 starts.
-
-### Concurrency Configuration
-
-**Syntax**:
-```yaml
-concurrency:
-  group: <group-name>
-  cancel-in-progress: <true|false>
-```
-
-**Group name**: Workflows with same group name are considered concurrent.
-
-**cancel-in-progress**:
-- `true`: Cancel older runs when new run starts
-- `false`: Queue new runs (wait for old ones to finish)
-
-### Common Concurrency Patterns
-
-**Pattern 1: One workflow run per branch**
-
-```yaml
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-```
-
-**Result**: New push to same branch cancels in-progress run from previous push.
-
-**Pattern 2: One workflow run per PR**
-
-```yaml
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-```
-
-**Result**: New commits to same PR cancel previous PR checks.
-
-**Pattern 3: Never cancel production deploys**
-
-```yaml
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-```
-
-**Result**: Production deploys queue up and run sequentially (never interrupt mid-deploy).
-
-### Complete Example
-
-```yaml
-name: Matrix and Conditionals
-
-on:
-  push:
-    branches: [main, develop]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  matrix-job:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        number: [1, 2]
-        letter: ['a', 'b', 'c']
-    runs-on: ubuntu-latest
+        os: [ubuntu-24.04, ubuntu-22.04]
     steps:
-      - run: echo "Matrix: ${{ matrix.number }}-${{ matrix.letter }}"
-  
-  sleep-job:
-    runs-on: ubuntu-latest
-    steps:
-      - run: sleep 100  # Deliberate delay to test cancellation
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - run: cat dist/info.txt && echo "tested on ${{ matrix.os }}"
 ```
 
-**Test scenario**:
-1. Trigger workflow (it starts sleeping)
-2. While sleeping, trigger again
-3. **Result**: First run cancels, second run takes over
+## 6. Execution walkthrough
 
-**In GitHub UI**: First run shows "Status: Canceled" with explanation that newer run superseded it.
+First run on a branch:
 
-## Key Takeaways
+1. Starting the run cancels any earlier in-progress run of the same group (`concurrency`).
+2. `build`: the cache step finds no entry for the key (miss). The slow branch executes (about 15 s), creates `.cache-demo/ready`, writes `dist/info.txt`, and uploads artifact `dist`. At the end of the job a new cache entry is saved under the exact key.
+3. `test` starts only after `build` succeeds. The matrix creates two jobs (`ubuntu-24.04`, `ubuntu-22.04`) on separate runners; each downloads `dist` and prints the file.
 
-**Runner types**:
-- GitHub-hosted: Easy, pre-configured, good for standard workloads
-- Third-party (Namespace): Faster, cheaper, better observability
-- Self-hosted: Maximum control, best for special requirements
+Second run with unchanged workflow file: the cache **hits**, the slow branch is skipped, and the post-job cache save is skipped because an entry already exists. Change the workflow file (the hash changes) and you get a miss again.
 
-**Artifacts**: Persist files across jobs and after workflow completion (build outputs, test results, logs)
+## 7. Common mistakes
 
-**Caching**: Speed up workflows by avoiding repetitive dependency downloads (language packages, build tools)
+| Mistake | Effect | Fix |
+|---|---|---|
+| `upload-artifact@v3` / `download-artifact@v3` | Fails since the January 2025 shutdown | Use `@v4` or newer |
+| Same artifact name from several matrix legs | v4 rejects duplicates | Add `${{ matrix.* }}` to the name |
+| Key without a lock-file hash | Stale dependencies forever | Hash the lock file |
+| Treating the cache as guaranteed | Flaky builds when evicted | Make the build correct without it |
+| Omitting `permissions:` | Token power depends on repo defaults | Declare it |
+| Listing one scope and expecting others to stay | Unlisted scopes become `none` | List every scope the job needs |
+| `id-token: write` with a wide cloud trust policy | Any repo can assume your role | Restrict `sub` to repo + branch/environment |
+| `runs-on: ubuntu-latest-arm` | No such label | `ubuntu-24.04-arm` |
+| `cancel-in-progress: true` on a production deploy | A half-applied deploy | Serialize instead |
+| Matrix from an empty JSON list | Workflow error | Guard with `if: needs.x.outputs.y != '[]'` |
+| Using `secrets.X != ''` in an `if` | Invalid | Use an `env` flag (Chapter 5) |
 
-**Permissions**: Grant minimum necessary GitHub API access per job (contents, issues, pull-requests, packages)
+## 8. Security considerations
 
-**Authentication**:
-- Static credentials: Simple, universally compatible, less secure
-- OIDC tokens: Complex setup, more secure, automatic rotation
+- Self-hosted runners and public repositories do not mix.
+- Artifacts and caches are readable data. Never store credentials in them.
+- Prefer OIDC to stored cloud keys; scope trust to repository + environment/branch; grant `id-token: write` only to the job that needs it.
+- Default to `contents: read`; use job-level elevation. Review any third-party action that receives a write-capable token.
+- Treat matrix values and `inputs` like any other interpolated text (Chapter 5).
 
-**Matrix strategies**: Test across multiple configurations simultaneously (OS versions, language versions, architectures)
+## 9. Hands-on exercise
 
-**Conditionals**: Run steps/jobs only when conditions met (branch checks, success/failure status, variable values)
+**Goal:** see cache hit/miss, artifact hand-off, matrix and concurrency.
 
-**Concurrency**: Prevent wasted resources by canceling obsolete workflow runs (per-branch, per-PR grouping)
+1. On a new branch, save the lab workflow above and run `actionlint`.
+2. Push and open a pull request. Note build duration and the "cache miss" line.
+3. Re-run the workflow (**Re-run all jobs**). Confirm "cache hit" and a shorter build.
+4. Edit the workflow (add a comment) and push twice quickly. Confirm the first run is cancelled by concurrency.
+5. Open the run summary and download the `dist` artifact.
+6. Remove `permissions:` from the workflow temporarily and, in the repository **Settings → Actions → General → Workflow permissions**, see which default is selected; restore the explicit block.
 
-## Next Chapter
+**What success looks like:** two matrix jobs, an artifact named `dist`, a miss then a hit, one cancelled run.
 
-You've now mastered both core and advanced GitHub Actions features. In Chapter 7, we'll explore the **GitHub Actions Marketplace**—a ecosystem of thousands of pre-built actions for common tasks. You'll learn how to find, evaluate, and integrate marketplace actions into your workflows, dramatically accelerating development by leveraging community-built solutions. From deploying to cloud providers to sending notifications, the marketplace has actions for almost every CI/CD task imaginable.
+**If it fails:** "Artifact name conflict" → name collision; "cache not restored" → key changed; matrix jobs skipped → the `build` job failed.
+
+## 10. Verification checklist
+
+- [ ] No `@v3` artifact actions.
+- [ ] `permissions` is declared at the top.
+- [ ] You can show a cache miss and a hit in the logs.
+- [ ] The artifact downloads and contains `info.txt`.
+- [ ] Concurrency cancelled the older run.
+- [ ] No secret is stored in cache or artifact.
+
+## 11. Knowledge check
+
+1. When would you use an artifact instead of a cache?
+2. Why include `hashFiles('**/package-lock.json')` in a cache key?
+3. A job sets `permissions: pull-requests: write` and nothing else. Can it check out a private repository?
+4. Why is OIDC safer than storing an access key?
+5. A matrix has `os: [a, b]`, `node: [20, 22]`, and `exclude` of one combination. How many jobs?
+6. When should `cancel-in-progress` be `false`?
+7. Why does a push made with `GITHUB_TOKEN` not trigger another workflow?
+
+<details>
+<summary>Answers</summary>
+
+1. When the file is an *output* that must be delivered or inspected; caches are only optimizations.
+2. So the cache is invalidated whenever dependencies change.
+3. No. Unlisted scopes (including `contents`) are `none`, so checkout of a private repo fails.
+4. The credentials are short-lived and tied to claims about the run, so a leak is much less useful.
+5. 4 − 1 = 3.
+6. For deployments and other operations that must not be interrupted.
+7. GitHub blocks it to prevent recursive workflow loops.
+</details>
+
+## 12. Key takeaways
+
+- Choose runners explicitly; verify labels; keep self-hosted runners away from untrusted code.
+- Artifacts deliver files; caches speed things up; never confuse the two.
+- Declare `permissions` everywhere; start at `contents: read`.
+- OIDC beats stored keys, but only with a tight trust policy.
+- Matrix fans out work; guard dynamic matrices against empty lists.
+- Concurrency prevents waste and collisions; do not cancel deploys.
+
+## Sources and further reading
+
+- Original notes: `git show master:06_advanced_features.md`. Corrections: outdated `@v3` artifact/cache actions, outdated runner labels (`ubuntu-20.04`, `macos-12/13`), invalid `ubuntu-latest-arm`, `secrets` in `if`, and the claim about default token permissions (now stated as setting-dependent). Unverified pricing, hardware and retention figures were removed.
+- Official docs: [Workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax) · [Dependency caching](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching) · [Authenticate with GITHUB_TOKEN](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token) · [OIDC](https://docs.github.com/en/actions/concepts/security/openid-connect) · [Runner images](https://github.com/actions/runner-images) · [Artifact v3 deprecation](https://github.blog/changelog/2024-04-16-deprecation-notice-v3-of-the-artifact-actions/)

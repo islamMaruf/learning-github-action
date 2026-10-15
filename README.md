@@ -1,182 +1,89 @@
-# GitHub Actions - Complete Learning Guide
+# GitHub Actions: A Structured Learning Guide
 
-A comprehensive learning resource for mastering GitHub Actions, from fundamental concepts to production-ready CI/CD pipelines. This guide covers everything you need to build automated workflows for modern software development.
+A 14-chapter guide that takes you from "what is a workflow?" to a multi-service CI/CD pipeline (test → build → version → GitOps → release), with exercises, checks and security notes in every chapter.
 
-🔗 **[Full Course Website](https://courses.devopsdirective.com/github-actions-beginner-to-pro)** | 📦 **[Course Repository](https://github.com/islamMaruf/devops-directive-github-actions-course)**
+## Attribution and scope
 
-## 📚 Course Overview
+This guide is a rewrite of study notes taken while following the DevOps Directive course *GitHub Actions: Beginner to Pro* by Sid Palas ([course site](https://courses.devopsdirective.com/github-actions-beginner-to-pro)). The notes were restructured as learning material, corrected against GitHub's documentation and action repositories, and extended with exercises. The structure and ideas owe much to that course; any errors in this version are not the course author's. Where the original notes disagreed with GitHub's current behavior, the chapter's **Sources** section says what changed.
 
-This learning path combines theory and hands-on practice to take you from beginner to proficient GitHub Actions practitioner. You'll learn to automate testing, building, deployment, and operational tasks using GitHub's native CI/CD platform.
+This repository contains **documentation only**: it has no workflow files of its own. Every workflow in the chapters is an example for you to create in your own practice repository.
 
-## 🎯 What You'll Learn
+## How the chapters are organized
 
-- GitHub Actions fundamentals and core concepts
-- Workflow authoring and automation patterns
-- Testing strategies for multi-service applications
-- Container image building and deployment
-- GitOps and release automation
-- Performance optimization and debugging techniques
-- Production-ready best practices
+Each chapter follows the same pattern: learning objectives → problem → core explanation → mental model → syntax → worked example → execution walkthrough → common mistakes → security → hands-on exercise → verification checklist → knowledge check (with answers) → key takeaways → sources.
 
-## 📖 Course Structure
+| # | Chapter | You will be able to… | Level |
+|---|---|---|---|
+| 1 | [What GitHub Actions is and how a workflow runs](01_introduction.md) | Explain events, jobs, steps, runners and the orchestrator/runner split; run a first workflow | Beginner |
+| 2 | [Why CI/CD exists](02_history_and_motivation.md) | Place CI tools in history; contrast push-based and GitOps delivery | Beginner |
+| 3 | [Why (and when not) GitHub Actions](03_why_github_actions.md) | Compare tools honestly; reduce lock-in | Beginner |
+| 4 | [Your development environment](04_development_environment.md) | Lint with `actionlint`, rehearse with `act`, use `gh` | Beginner |
+| 5 | [Core features](05_core_features.md) | Triggers, filters, jobs and `needs`, env scopes, outputs, secrets, contexts, safe inputs | Beginner → Intermediate |
+| 6 | [Advanced features](06_advanced_features.md) | Runners, artifacts, caching, permissions, OIDC, matrix, concurrency | Intermediate |
+| 7 | [Using marketplace actions safely](07_marketplace_actions.md) | Evaluate actions, pin to SHAs, automate updates | Intermediate |
+| 8 | [Authoring reusable logic](08_authoring_actions.md) | Composite actions, reusable workflows, JS and container actions | Intermediate → Advanced |
+| 9 | [Common workflow patterns](09_common_workflows.md) | Lint/test/build/deploy/release/chores | Intermediate |
+| 10 | [Developer experience](10_developer_experience.md) | Taskfile-driven pipelines, debug logging, measuring | Intermediate |
+| 11 | [Best practices](11_best_practices.md) | Performance, maintainability, security baseline, audit checklist | Intermediate → Advanced |
+| 12 | [Capstone 1: monorepo test workflow](12_test_workflow.md) | Change detection, dynamic matrix, gate job | Advanced |
+| 13 | [Capstone 2: build, version, push images](13_build_push_images.md) | `git describe` versions, Buildx, GHCR | Advanced |
+| 14 | [Capstone 3: GitOps, releases, chores, timing](14_remaining_workflows_conclusion.md) | Reusable GitOps update, retries, approvals, wrap-up | Advanced |
 
-### [Chapter 1: Introduction to GitHub Actions](01_introduction.md)
-Get started with GitHub Actions basics. Learn what GitHub Actions is, why automation matters in modern software development, and understand the course structure. Covers the learning approach, prerequisites, and sets expectations for the hands-on journey ahead.
+**Suggested reading order:** straight through, 1 → 14. If you already know the basics, read 5, 6, 11 first, then do the capstone (12 → 14). Do the exercises in a **practice repository you own**, never in a real project, and use branches and pull requests rather than pushing experiments to a production branch.
 
-**Key Topics:** Automation fundamentals, CI/CD concepts, course methodology, learning rhythm
+## Prerequisites
 
----
+Git (clone, branch, commit, pull request), a terminal, a GitHub account, and a code editor. Docker is needed from Chapter 13. On Windows, use WSL 2.
 
-### [Chapter 2: History and Motivation](02_history_and_motivation.md)
-Explore the evolution of software delivery from punch cards to continuous deployment. Understand the historical context that led to modern CI/CD practices and see how GitHub Actions fits into the broader landscape of automation tools.
+## How to Read, Verify, and Revisit This Guide
 
-**Key Topics:** Software delivery evolution, CI/CD history, deployment frequency trends, infrastructure as code
+**Reading.** Read a chapter, then do its exercise before moving on. The knowledge-check answers are collapsed under each chapter; try first.
 
----
+**What was verified, and how.**
 
-### [Chapter 3: Why GitHub Actions?](03_why_github_actions.md)
-Compare GitHub Actions with alternatives like Jenkins, GitLab CI, CircleCI, and Travis CI. Learn the strengths and trade-offs of each platform to make informed decisions about which tool fits your team's needs.
+- Facts about GitHub behavior were checked against GitHub's documentation where the page could be retrieved, and action tags and commit SHAs were checked with `git ls-remote` against the action repositories. Chapters list items that were **not** verified under "Sources and further reading".
+- Scripts were executed in scratch Git repositories: `scripts/image-version.sh` and the *Plan builds* step of the Chapter 13 workflow (push, tag, empty and invalid-tag cases), and `scripts/update-image-tag.sh` (Chapter 14). The three shell scripts also passed `bash -n`.
+- All 74 YAML code blocks parse as YAML (PyYAML). The 23 complete workflows also passed a basic structural check (jobs have `runs-on`/`steps` or `uses`, `needs` refer to existing jobs, no inline untrusted values in `run:`).
+- **`actionlint` and `shellcheck` could not be installed in the environment used for this rewrite, so neither was run.** Run `actionlint` yourself on every workflow you create.
+- **No workflow in this guide was run on GitHub**, and no Docker image was built, during this rewrite. Treat the workflows as carefully reviewed examples: run `actionlint` on them and test them on a branch in a practice repository.
 
-**Key Topics:** Platform comparison, GitHub Actions advantages, expressiveness limitations, debugging experience, cost analysis
+**Things that go stale.** Action major versions (the examples use versions that were current when the chapters were written; newer majors of several actions, such as the `actions/setup-*`, `actions/cache` and `docker/*` actions, already exist), runner image labels, pricing and quotas, Node runtimes, UI wording, and repository-setting names. When a chapter tells you to check the docs, do.
 
----
+**Revisiting.** Re-read Chapters 7 and 11 when you add a new third-party action or change a deploy path. After a security advisory about an action, search your workflows for it. Update pinned SHAs through Dependabot, not by hand.
 
-### [Chapter 4: Development Environment Setup](04_development_environment.md)
-Set up a reproducible development environment using Devbox and other essential tools. Learn to fork and clone the course repository, install dependencies, and configure local testing capabilities.
+### Source reference table
 
-**Key Topics:** Devbox installation, repository setup, tool configuration, local workflow testing with Act
+The original files are the 14 chapter notes from the previous version of this repository (retrievable with `git show master:<file>`). This repository has no workflow files, so the "workflow file" column points to examples inside the guide.
 
----
+| Learning topic | Guide section | Original source file | Relevant workflow file | Verification notes |
+|---|---|---|---|---|
+| Orchestrator vs runner; VM vs container | Ch. 1 | `01_introduction.md` | `hello.yml` example in Ch. 1 | Conceptual; no live run |
+| CI/CD history; push vs GitOps | Ch. 2 | `02_history_and_motivation.md` | none | Dates approximate; unsourced statistics removed |
+| Tool comparison | Ch. 3 | `03_why_github_actions.md` | thin-workflow example in Ch. 3 | Vendor claims removed; check current pricing yourself |
+| Local tooling | Ch. 4 | `04_development_environment.md` | `check.yml` in Ch. 4 | Tool commands not executed here |
+| Events, jobs, outputs, secrets, contexts | Ch. 5 | `05_core_features.md` | `core-lab.yml` in Ch. 5 | `node` is not a documented shell; `secrets` unavailable in `if` (docs) |
+| Runners, artifacts, cache, permissions, OIDC, matrix, concurrency | Ch. 6 | `06_advanced_features.md` | `advanced-lab.yml` in Ch. 6 | Artifact v3 shutdown and valid runner labels checked; pricing/limits deferred to docs |
+| Marketplace actions, pinning | Ch. 7 | `07_marketplace_actions.md` | `ci.yml` (pinned) in Ch. 7 | `actions/checkout` v4.2.2 SHA checked via `git ls-remote` |
+| Composite actions, reusable workflows, JS/container actions | Ch. 8 | `08_authoring_actions.md` | examples in Ch. 8 | Environment-secret behavior and nesting limits flagged for verification |
+| Lint/test/build/deploy/release/stale/dependency patterns | Ch. 9 | `09_common_workflows.md` | `ci.yml`, `deploy.yml`, `release.yml` in Ch. 9 | Archived status of `actions/create-release` from knowledge, not re-checked |
+| Taskfile, `act`, debugging, measuring | Ch. 10 | `10_developer_experience.md` | `check`/diagnostic examples in Ch. 10 | `breakpoint-action` has `@v0`, no `@v1` (checked) |
+| Performance, maintainability, security baseline | Ch. 11 | `11_best_practices.md` | gate-job example in Ch. 11 | Settings UI wording flagged for verification |
+| Change detection, dynamic matrix, gate | Ch. 12 | `12_test_workflow.md` | `test.yml` in Ch. 12 | `dorny/paths-filter` v3.0.2 SHA checked; not run on GitHub |
+| Versioning, Buildx, GHCR | Ch. 13 | `13_build_push_images.md` | `build-push.yml` in Ch. 13 | Version script run in scratch repo; Docker builds not run |
+| GitOps update, retry, releases, timing export | Ch. 14 | `14_remaining_workflows_conclusion.md` | `gitops-update.yml`, `release.yml` in Ch. 14 | Update script run in scratch repo; Honeycomb action's README read, action not run |
 
-### [Chapter 5: Core Features](05_core_features.md)
-Master the fundamental building blocks of GitHub Actions: events, workflows, jobs, steps, and runners. Learn to trigger workflows, pass data between components, manage secrets, and control execution flow.
+## Safety rules used throughout
 
-**Key Topics:** Workflow anatomy, event triggers, job orchestration, context and expressions, secrets management, artifacts
+- Practice in your own repository; use branches and pull requests, or manual triggers, to test.
+- Never put real credentials in a workflow or document. Use secrets, and prefer OIDC to stored cloud keys.
+- Pass untrusted text (PR titles, branch names, inputs) through `env:`, never inline into `run:` scripts.
+- Declare `permissions:` in every workflow; start from `contents: read`.
+- Pin third-party actions to commit SHAs and update them with automation.
 
----
+## Further reading
 
-### [Chapter 6: Advanced Features](06_advanced_features.md)
-Extend your workflow capabilities with advanced GitHub Actions features. Explore runner types (GitHub-hosted, self-hosted, third-party), job containers, matrix strategies, concurrency control, and permissions management.
-
-**Key Topics:** Runner infrastructure, container jobs, matrix builds, concurrency groups, GITHUB_TOKEN permissions, caching strategies
-
----
-
-### [Chapter 7: GitHub Actions Marketplace](07_marketplace_actions.md)
-Leverage thousands of pre-built actions from the GitHub Actions Marketplace. Learn to discover, evaluate, and integrate community-built solutions while understanding security considerations and versioning strategies.
-
-**Key Topics:** Marketplace navigation, action evaluation, security best practices, popular actions, version pinning
-
----
-
-### [Chapter 8: Authoring Actions](08_authoring_actions.md)
-Create custom reusable logic with composite actions, reusable workflows, JavaScript actions, and container actions. Understand when to use each approach and how to structure, test, and publish your own actions.
-
-**Key Topics:** Composite actions, reusable workflows, JavaScript/TypeScript actions, Docker actions, publishing strategies
-
----
-
-### [Chapter 9: Common Workflows](09_common_workflows.md)
-Explore real-world workflow patterns for testing, building, deploying, and releasing applications. See practical examples of CI/CD automation across different programming languages and deployment targets.
-
-**Key Topics:** CI/CD patterns, deployment workflows, release automation, multi-environment deployments
-
----
-
-### [Chapter 10: Developer Experience](10_developer_experience.md)
-Speed up development and debug workflows efficiently. Learn techniques for local testing, SSH debugging, performance monitoring, and iteration strategies that minimize the "push and pray" cycle.
-
-**Key Topics:** Local action testing, Act workflow runner, debugging strategies, VS Code extensions, performance monitoring with Honeycomb
-
----
-
-### [Chapter 11: Best Practices](11_best_practices.md)
-Build production-grade workflows with performance optimization, maintainability patterns, and security practices. Learn monorepo vs. multirepo considerations and how to scale automation as your team grows.
-
-**Key Topics:** Performance optimization, caching strategies, security practices, workflow maintainability, monorepo patterns, cost optimization
-
----
-
-### [Chapter 12: Test Workflow](12_test_workflow.md)
-Build a comprehensive test workflow for a multi-service monorepo application. Implement intelligent service filtering, language-specific testing, and conditional execution to optimize CI performance.
-
-**Key Topics:** Monorepo testing, path filtering, matrix strategies, conditional execution, multi-language support
-
----
-
-### [Chapter 13: Build and Push Images](13_build_push_images.md)
-Automate container image building and publishing for multiple services. Implement semantic versioning, environment-specific tagging, and multi-architecture builds with proper registry authentication.
-
-**Key Topics:** Docker image building, semantic versioning, container registries, multi-architecture builds, Taskfile conventions
-
----
-
-### [Chapter 14: GitOps and Automation](14_remaining_workflows_conclusion.md)
-Complete your CI/CD pipeline with GitOps manifest updates, release automation, stale issue management, and performance monitoring. Integrate all course concepts into a production-ready DevOps platform.
-
-**Key Topics:** GitOps deployment, Kubernetes manifest updates, release automation, issue management, observability
-
----
-
-## 🚀 Getting Started
-
-1. **Visit the [course website](https://courses.devopsdirective.com/github-actions-beginner-to-pro)** for video content
-2. **Fork the [course repository](https://github.com/islamMaruf/devops-directive-github-actions-course)** to your GitHub account
-3. **Clone with submodules**: `git clone --recurse-submodules <your-fork-url>`
-4. **Set up development environment** following Chapter 4
-5. **Start with Chapter 1** and progress sequentially
-6. **Practice with examples** in each chapter
-
-## 🛠️ Prerequisites
-
-- **Git** installed and basic familiarity
-- **GitHub account** (free tier sufficient)
-- **Terminal/command-line** experience
-- **Code editor** (VS Code recommended)
-- **Operating system**: macOS, Linux, or Windows with WSL
-
-## 📦 What's Included
-
-- Comprehensive written documentation for each chapter
-- Hands-on workflow examples and templates
-- Capstone project with multi-service application
-- Best practices and production patterns
-- Debugging and optimization techniques
-
-## 🎓 Learning Path
-
-**Beginner Track** (Chapters 1-5): Start here if you're new to GitHub Actions. Learn fundamentals, core features, and basic workflow creation.
-
-**Intermediate Track** (Chapters 6-9): Build on fundamentals with advanced features, marketplace actions, custom action authoring, and common patterns.
-
-**Advanced Track** (Chapters 10-14): Master professional practices including debugging, performance optimization, and building production CI/CD pipelines.
-
-## 💡 Course Philosophy
-
-This course follows a **theory-then-practice** approach:
-- **Theory sections** explain concepts, features, and mental models
-- **Practice sections** apply knowledge through hands-on examples
-- **Real-world examples** demonstrate production usage patterns
-- **Iterative learning** builds complexity progressively
-
-## 🔗 Additional Resources
-
-- [Full Course Website](https://courses.devopsdirective.com/github-actions-beginner-to-pro) - Complete video and written content
-- [Course GitHub Repository](https://github.com/islamMaruf/devops-directive-github-actions-course) - All code examples and workflows
-- [GitHub Actions Documentation](https://docs.github.com/en/actions) - Official documentation
-- [GitHub Actions Marketplace](https://github.com/marketplace?type=actions) - Pre-built actions
-
-## 📝 Notes
-
-- All examples are tested and production-ready
-- Workflows can be adapted to your specific projects
-- Community contributions and feedback welcome
-- Regular updates with new features and best practices
-
-## 🙏 Acknowledgments
-
-This comprehensive guide represents months of research, practical experience, and refinement to create the definitive resource for learning GitHub Actions effectively.
-
----
-
-**Ready to automate everything?** Start with [Chapter 1: Introduction to GitHub Actions](01_introduction.md) and begin your journey to CI/CD mastery!
+- [GitHub Actions documentation](https://docs.github.com/en/actions)
+- [Workflow syntax reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+- [Runner images](https://github.com/actions/runner-images)
+- [actionlint](https://github.com/rhysd/actionlint) and [act](https://github.com/nektos/act)
+- The original course: [DevOps Directive, GitHub Actions: Beginner to Pro](https://courses.devopsdirective.com/github-actions-beginner-to-pro)

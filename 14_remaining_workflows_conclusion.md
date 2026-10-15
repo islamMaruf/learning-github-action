@@ -1,963 +1,408 @@
-# Chapter 14: Completing the CI/CD Pipeline - GitOps, Automation, and Conclusion
+# Chapter 14: Capstone, Part 3: GitOps Deployment, Releases, Chores, Timing and Wrap-up
 
-## Introduction
+> **Level:** advanced · **Time:** 4–5 hours · **Prerequisites:** [Chapters 8, 11, 12, 13](13_build_push_images.md)
+> **Next:** [README: roadmap and how to verify this guide](README.md)
 
-In this final chapter of the capstone project, we'll complete our comprehensive CI/CD automation system by implementing the remaining workflows: GitOps manifest updates, release automation, stale issue management, and performance monitoring. These workflows demonstrate advanced GitHub Actions patterns and integrate all concepts from the course into a production-ready DevOps platform.
+## Learning objectives
 
-We'll also reflect on what we've built, best practices for maintaining and extending these workflows, and how to continue your GitHub Actions journey beyond this course.
+After this chapter you can:
 
-## Part 1: GitOps Manifest Update Workflow
+- Explain GitOps and implement the CI half of it: a reusable workflow that updates an image tag in a manifest file and pushes safely.
+- Handle concurrent pushes with rebase-and-retry, and explain why `GITHUB_TOKEN` pushes don't trigger new runs.
+- Wire the GitOps update into the build workflow with a matrix, environment approvals and least privilege.
+- Create releases from tags.
+- Reuse the stale-issue and dependency-update patterns from Chapter 9.
+- Describe how to export workflow timing data to an observability platform.
+- Review the whole capstone against the security, performance and maintainability checklist.
 
-### Understanding GitOps Deployment
+## 1. Problem statement
 
-GitOps is a deployment methodology where the desired state of your infrastructure and applications is declaratively defined in Git repositories. Changes to these repositories trigger automated deployments through continuous reconciliation by agents like Argo CD or Flux.
+Chapter 13 produces versioned images. Something must now make a running environment use them. In **GitOps**, CI does not deploy; it changes a file in Git that *describes* what should run, and an agent in the target environment (Argo CD or Flux for Kubernetes) notices and applies it. CI needs no credentials for the cluster, every change is a commit, and rollback is a `git revert`. The remaining capstone workflows complete the loop: GitOps update, releases, repository chores and timing data.
 
-**GitOps workflow:**
-1. Application code changes trigger CI pipeline
-2. CI builds and pushes new container image with versioned tag
-3. Automation updates Kubernetes manifests with new image version
-4. Manifest changes are committed to Git
-5. GitOps agent detects manifest change
-6. Agent applies changes to Kubernetes cluster
-7. Cluster state converges to desired state defined in Git
+## 2. Core explanation
 
-**Key benefit**: Git becomes the single source of truth for both application code and deployment configuration, providing audit trail, rollback capability, and declarative infrastructure management.
-
-### Manifest Structure
-
-Our Kubernetes manifests are organized by environment:
+### Lesson 14.1: What the CI part of GitOps does
 
 ```
-deploy/
-├── kubernetes/
-│   └── kustomize/
-│       ├── base/
-│       │   └── services/
-│       │       ├── api-node/
-│       │       │   └── deployment.yaml
-│       │       ├── api-golang/
-│       │       │   └── deployment.yaml
-│       │       └── client-react/
-│       │           └── deployment.yaml
-│       └── overlays/
-│           ├── staging/
-│           │   └── config/
-│           │       └── staging.yaml
-│           └── production/
-│           │   └── config/
-│           │       └── production.yaml
+build image ──▶ edit manifest (image tag) ──▶ commit & push ──▶ agent detects ──▶ cluster converges
+   (Ch. 13)        (this chapter)                                 (Argo CD / Flux, out of scope)
 ```
 
-**Kustomize structure**: Base manifests define service deployments with template variables. Overlay directories contain environment-specific configurations that patch the base manifests.
+The deployment agent itself is outside this guide. This chapter builds and tests only the CI half. In production the manifests usually live in a **separate repository** (so that deploy history and permissions are separate from application code) and the workflow pushes to it with a dedicated credential. For the lab, the manifest file lives in your practice repository and the workflow pushes to a **throwaway branch**, so you can practice without touching `main`.
 
-**Configuration files** (`staging.yaml`, `production.yaml`):
+### Lesson 14.2: The manifest and the update script
+
+A simplified manifest, `deploy/staging/images.yaml` (a real project would typically use Kustomize overlays; the technique is the same):
 
 ```yaml
-# deploy/kubernetes/kustomize/overlays/staging/config/staging.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: image-versions
 data:
-  api-node: "sidpalas/demo-api-node:1.0.9-0047-188f7" # staging_services/node/api-node
-  api-golang: "sidpalas/demo-api-golang:1.0.9-0032-abc12" # staging_services/go/api-golang
-  client-react: "sidpalas/demo-client:2.1.0-0015-def34" # staging_services/react/client-react
+  api-golang: "ghcr.io/OWNER/REPO/api-golang:0.0.0-0001-abc1234" # services/go/api-golang
+  api-node: "ghcr.io/OWNER/REPO/api-node:0.0.0-0001-abc1234" # services/node/api-node
 ```
 
-The comments are identifier tags used by our automation to locate and update specific version values.
+The trailing comment is a **marker** that identifies which line belongs to which service. Create the same for `deploy/production/images.yaml`. Use your own owner and repository in place of `OWNER/REPO`.
 
-### Workflow Design
+The update script `scripts/update-image-tag.sh`. It validates every argument against a strict pattern, so nothing unexpected can reach `sed`:
 
-**Inputs**:
-- `service`: Path to service directory (e.g., `services/node/api-node`)
-- `version`: Image tag to deploy (e.g., `1.0.9-0047-188f7`)
-- `environment`: Target environment (`development`, `staging`, `production`)
+```bash
+#!/usr/bin/env bash
+# Usage: scripts/update-image-tag.sh <environment> <service-dir> <version>
+# Rewrites the image reference on the line tagged "# <service-dir>" in deploy/<environment>/images.yaml
+set -euo pipefail
+env_name="$1"; service="$2"; version="$3"
 
-**Process**:
-1. Checkout repository
-2. Locate config file matching environment
-3. Find line with identifier comment matching `{environment}_{service}`
-4. Replace version value
-5. Commit and push changes with retry logic
+[[ "$env_name" =~ ^(staging|production)$ ]]                              || { echo "bad environment" >&2; exit 1; }
+[[ "$service" =~ ^services/[a-z0-9_-]+/[a-z0-9_-]+$ ]]                   || { echo "bad service" >&2; exit 1; }
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]{4}-[0-9a-f]{7,40})?$ ]]  || { echo "bad version" >&2; exit 1; }
+[[ "${IMAGE_REPO:-}" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]                      || { echo "bad IMAGE_REPO" >&2; exit 1; }
 
-### Workflow Implementation
+file="deploy/${env_name}/images.yaml"
+name="$(basename "$service")"
+grep -q "# ${service}\$" "$file" || { echo "no line tagged '# ${service}' in $file" >&2; exit 1; }
+
+sed -i "\|# ${service}\$|s|\"[^\"]*\"|\"${IMAGE_REPO}/${name}:${version}\"|" "$file"
+```
+
+This script was run in a scratch repository during preparation of this guide. A valid call rewrote exactly one line; an invalid service (`services/x/y;rm`), a service with no marker line, and a version containing `&` were each rejected with a non-zero exit. (In that test the version pattern used `{7}` for the hash; this version allows 7–40 hex characters because `git describe` can abbreviate longer than seven when a repository is large.)
+
+### Lesson 14.3: Push with retry
+
+Several services can finish at the same moment, and each tries to push to the same branch. The loser's push is rejected because the remote advanced. The fix: commit once, then loop: *push; if rejected, `git pull --rebase`, wait with a small random delay, try again.*
+
+`scripts/git-commit-push.sh`:
+
+```bash
+#!/usr/bin/env bash
+# Usage: COMMIT_MESSAGE=... BRANCH=... scripts/git-commit-push.sh
+set -euo pipefail
+retries="${RETRIES:-5}"
+
+git add -A
+if git diff --cached --quiet; then
+  echo "No changes to commit"
+  exit 0
+fi
+git commit -m "$COMMIT_MESSAGE"
+
+for attempt in $(seq 1 "$retries"); do
+  if git push origin "HEAD:${BRANCH}"; then
+    echo "Pushed on attempt ${attempt}"
+    exit 0
+  fi
+  echo "Push rejected (attempt ${attempt}/${retries}); rebasing"
+  git pull --rebase origin "$BRANCH"
+  sleep $(( (2 ** attempt) + RANDOM % 3 ))      # exponential backoff plus jitter
+done
+echo "Failed to push after ${retries} attempts" >&2
+exit 1
+```
+
+Rebase keeps the history linear. The jitter prevents several waiting runs from retrying at the same instant. Note that the original design committed inside the loop (creating repeated commits on retries); here the commit happens once.
+
+### Lesson 14.4: A reusable GitOps workflow
+
+Use `workflow_call` so the build workflow can call it, plus `workflow_dispatch` so you can run it by hand. `.github/workflows/gitops-update.yml`:
 
 ```yaml
-name: Update GitOps Manifests
+name: Update GitOps manifests
 
 on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: true
+      branch:
+        type: string
+        required: false
+        default: main
   workflow_dispatch:
     inputs:
       service:
-        description: 'Service to update'
-        required: true
+        description: Service directory
         type: choice
+        required: true
         options:
           - services/node/api-node
           - services/go/api-golang
-          - services/react/client-react
           - services/python/load-generator
-          - services/other/migrator
       version:
-        description: 'Image version tag'
-        required: true
+        description: Image version, for example 1.0.9-0047-452cc9a
         type: string
-      environment:
-        description: 'Target environment'
         required: true
+      environment:
+        description: Target environment
         type: choice
-        options:
-          - development
-          - staging
-          - production
+        required: true
+        options: [staging, production]
+      branch:
+        description: Branch to push the manifest change to
+        type: string
+        required: false
+        default: gitops-demo
+
+permissions:
+  contents: read
 
 concurrency:
-  group: gitops-${{ github.event.inputs.service }}-${{ github.event.inputs.environment }}
+  group: gitops-${{ inputs.service }}-${{ inputs.environment }}
   cancel-in-progress: false
 
 jobs:
   update-manifest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }}      # production can require reviewers
+    permissions:
+      contents: write                            # to push the manifest commit
     steps:
-      - name: Checkout code
-        uses: actions/checkout@4.2.2
+      - uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Setup dependencies
-        uses: ./.github/actions/setup-dependencies
-        
-      - name: Generate commit message
-        id: commit-msg
+          ref: ${{ inputs.branch }}
+          persist-credentials: true             # this job pushes, so it keeps the token
+
+      - name: Update image tag
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ inputs.version }}
         run: |
-          MSG="chore: update ${{ github.event.inputs.environment }}, ${{ github.event.inputs.service }}, ${{ github.event.inputs.version }} [skip ci]"
-          echo "message=$MSG" >> $GITHUB_OUTPUT
-          
-      - name: Update manifests
-        id: update
-        working-directory: ${{ github.event.inputs.service }}
-        env:
-          ENVIRONMENT: ${{ github.event.inputs.environment }}
-          VERSION: ${{ github.event.inputs.version }}
-        run: task utils:update-image-tags
-        
-      - name: Show diff
-        run: git --no-pager diff
-        
+          IMAGE_REPO="ghcr.io/${GITHUB_REPOSITORY,,}" \
+            scripts/update-image-tag.sh "$ENVIRONMENT" "$SERVICE" "$VERSION"
+          git --no-pager diff
+
       - name: Commit and push
-        if: env.ACT != 'true'
-        working-directory: ${{ github.event.inputs.service }}
         env:
-          COMMIT_MESSAGE: ${{ steps.commit-msg.outputs.message }}
-          BRANCH: main
-        run: task utils:git-commit-push
+          BRANCH: ${{ inputs.branch }}
+          COMMIT_MESSAGE: "chore(deploy): ${{ inputs.environment }} ${{ inputs.service }} ${{ inputs.version }}"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/git-commit-push.sh
 ```
 
-### Update Script Logic
+Corrections compared with the original design, in one place:
 
-The `utils:update-image-tags` task uses bash and sed to perform the update:
+- The original had no `workflow_call` trigger, so `uses:` from the build workflow could not work. It is added here.
+- It interpolated `inputs` into a shell string to build a commit message. Here every input is passed through `env:` and validated by the script (the commit message is built in `env:` from values already restricted by the choice options or validated in the script step that runs first).
+- It needs `contents: write`; with the repository's default read-only token it would fail.
+- Marking commits `[skip ci]` is unnecessary for pushes made with `GITHUB_TOKEN`: GitHub does not start new workflow runs for events caused by that token (a loop guard). If your GitOps repository has its own workflows that must run on this commit, push with a GitHub App token or deploy key instead.
+- Branch protection on `main` may reject the bot's push. Real setups use a separate manifests repository where the bot is allowed to push, or open a pull request instead.
 
-```bash
-#!/bin/bash
-# Task: utils:update-image-tags
+(The commit message is built inside `env:`, which is data, not script text. The earlier step runs the validating script first, so a malformed `version` fails the job before any commit is made.)
 
-IDENTIFIER_COMMENT="${ENVIRONMENT}_${SERVICE_RELEASE_TAG}"
-START_PATH="deploy/kubernetes/kustomize/overlays/${ENVIRONMENT}"
-EXCLUDE_PATTERNS="-not -path '*/taskfile.yaml' -not -path '*/.git/*'"
+### Lesson 14.5: Wiring it into the build workflow
 
-# Find all YAML files containing the identifier comment
-FILES=$(find ${START_PATH} -name '*.yaml' ${EXCLUDE_PATTERNS} -exec grep -l "${IDENTIFIER_COMMENT}" {} \;)
-
-for FILE in $FILES; do
-  echo "Updating $FILE"
-  # Replace version on line containing identifier comment
-  sed -i "/${IDENTIFIER_COMMENT}/s/: \".*\"/: \"${NEW_TAG}\"/" "$FILE"
-done
-```
-
-**Key features**:
-- Recursive search from environment-specific overlay directory
-- Grep filters files containing the identifier comment
-- Sed performs in-place replacement on matching lines
-- Multiple services can be updated independently
-
-### Retry Logic for Concurrent Updates
-
-Multiple services may build and deploy simultaneously. If two workflows try to push commits concurrently, one will fail due to the remote having advanced. We implement retry logic with exponential backoff:
-
-```bash
-#!/bin/bash
-# Task: utils:git-commit-push
-
-RETRIES=${RETRIES:-5}
-DELAY=${DELAY:-2}
-JITTER=${JITTER:-3}
-
-for i in $(seq 1 $RETRIES); do
-  # Stage changes
-  git add -A
-  
-  # Check if there are changes to commit
-  if git diff --cached --quiet; then
-    echo "No changes to commit"
-    exit 0
-  fi
-  
-  # Commit changes
-  git commit -m "${COMMIT_MESSAGE}"
-  
-  # Try to push
-  if git push origin "${BRANCH}"; then
-    echo "Successfully pushed on attempt $i"
-    exit 0
-  else
-    echo "Push failed on attempt $i"
-    
-    if [ $i -lt $RETRIES ]; then
-      # Pull latest changes and rebase
-      git pull --rebase origin "${BRANCH}"
-      
-      # Calculate backoff with jitter
-      WAIT_TIME=$((DELAY * (2 ** (i - 1)) + RANDOM % JITTER))
-      echo "Retrying in ${WAIT_TIME} seconds..."
-      sleep $WAIT_TIME
-    fi
-  fi
-done
-
-echo "Failed to push after $RETRIES attempts"
-exit 1
-```
-
-**Retry strategy**:
-- **Attempt 1**: Immediate push
-- **Failure**: Pull latest changes, rebase, wait with exponential backoff
-- **Exponential backoff**: 2s, 4s, 8s, 16s, 32s (plus random jitter)
-- **Random jitter**: Prevents thundering herd if multiple workflows retry simultaneously
-- **Rebase**: Integrates remote changes, allowing push to succeed
-
-**Why rebase over merge?**: Rebasing creates linear history without merge commits, keeping the GitOps repository clean and making it easier to understand deployment history.
-
-### Concurrency Control
+Add to the end of `.github/workflows/build-push.yml` (Chapter 13). The `plan` job already emitted `service` and `version` for each image, so the deploy matrix needs no outputs from the build legs:
 
 ```yaml
-concurrency:
-  group: gitops-${{ github.event.inputs.service }}-${{ github.event.inputs.environment }}
-  cancel-in-progress: false
-```
-
-**Concurrency key**: Combines service and environment to create unique group identifier. Multiple runs updating different services or environments proceed in parallel. Multiple runs updating the same service and environment execute serially.
-
-**cancel-in-progress: false**: Queued runs wait rather than canceling. This ensures every deployment eventually processes even if multiple builds trigger rapid updates.
-
-**Trade-off**: Serial execution for the same service/environment is slower but ensures correctness. The retry logic handles most concurrent cases, so serialization rarely occurs.
-
-### Integration with Build Workflow
-
-Add a workflow call to the end of the build-push workflow:
-
-```yaml
-jobs:
-  # ... existing filter and build-push jobs ...
-  
-  update-gitops:
-    needs: build-push
-    if: |
-      needs.filter.outputs.environment == 'staging' ||
-      needs.filter.outputs.environment == 'production'
-    uses: ./.github/workflows/update-gitops-manifests.yaml
+  deploy:
+    needs: [plan, build]
+    if: ${{ github.event_name == 'push' && needs.plan.outputs.matrix != '[]' }}
+    permissions:
+      contents: write          # a called workflow can never exceed the caller's permissions
     strategy:
+      fail-fast: false
       matrix:
-        service: ${{ fromJSON(needs.filter.outputs.services) }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    uses: ./.github/workflows/gitops-update.yml
     with:
       service: ${{ matrix.service }}
-      version: ${{ needs.build-push.outputs[matrix.service].version }}
-      environment: ${{ needs.filter.outputs.environment }}
-    secrets: inherit
+      version: ${{ matrix.version }}
+      environment: ${{ github.ref_type == 'tag' && 'production' || 'staging' }}
+      branch: main
 ```
 
-**Conditional execution**: Only updates manifests for staging and production environments. Development builds skip GitOps updates since they're typically deployed ad-hoc.
+The original used `needs.build-push.outputs[matrix.service].version`, which is not valid for matrix jobs (a matrix job has a single output namespace, and the last leg to write wins). Computing the versions once in `plan` and reusing them is the fix.
 
-**Matrix iteration**: Calls the GitOps workflow once per built service, passing the version output from the build job.
+Behavior: pushes to `main` update **staging**; release tags update **production**, after approval if the `production` environment requires reviewers (the environment is declared in the called job). Manual runs of the build workflow don't deploy. Also `secrets: inherit` is not needed: this workflow uses only `GITHUB_TOKEN`.
 
-**secrets: inherit**: Passes repository secrets to the called workflow, enabling GitHub token authentication.
+### Lesson 14.6: Releases from tags
 
-## Part 2: Release Automation Workflow
-
-### Semantic Versioning and Release Tags
-
-Our project uses semantic versioning with service-specific release tags:
-
-**Tag format**: `services/go/api-golang@1.2.3`
-- Service path prefix identifies which service the release applies to
-- @ separator distinguishes from branch names
-- Semantic version follows: MAJOR.MINOR.PATCH
-
-**When to release**:
-- **MAJOR**: Breaking changes to API contracts
-- **MINOR**: New features, backward compatible
-- **PATCH**: Bug fixes, backward compatible
-
-### Automated Release Creation
-
-While this course doesn't implement fully automated semantic versioning (which requires commit message analysis à la Conventional Commits), we establish the foundation for manual or semi-automated releases.
-
-**Manual release process**:
-1. Developer determines appropriate version bump
-2. Creates tag locally: `git tag services/go/api-golang@1.2.3`
-3. Pushes tag: `git push origin services/go/api-golang@1.2.3`
-4. Tag push triggers build-push workflow in production mode
-5. Production image builds and pushes
-6. GitOps workflow updates production manifests
-7. Release notes generated automatically
-
-**Potential enhancements** (beyond course scope):
-- Analyze commit messages since last release
-- Determine version bump automatically
-- Generate changelog from commit history
-- Create GitHub release with assets
-
-### Release Notes Generation
-
-A simple workflow can create GitHub releases when tags are pushed:
+A small workflow creates a GitHub release when a release tag is pushed. `.github/workflows/release.yml`:
 
 ```yaml
-name: Create Release
+name: Release
 
 on:
   push:
-    tags:
-      - '*@[0-9]+.[0-9]+.[0-9]+'
+    tags: ['**@[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@4.2.2
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-          
-      - name: Extract release info
-        id: info
-        run: |
-          TAG_NAME="${{ github.ref_name }}"
-          SERVICE="${TAG_NAME%@*}"
-          VERSION="${TAG_NAME#*@}"
-          echo "service=$SERVICE" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-      - name: Generate changelog
-        id: changelog
-        run: |
-          # Find previous tag for this service
-          PREV_TAG=$(git tag -l "${{ steps.info.outputs.service }}@*" --sort=-version:refname | sed -n '2p')
-          
-          if [ -n "$PREV_TAG" ]; then
-            # Generate changelog from commits between tags
-            CHANGELOG=$(git log --pretty=format:"- %s" ${PREV_TAG}..HEAD)
-          else
-            CHANGELOG="Initial release"
-          fi
-          
-          echo "changelog<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGELOG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-      - name: Create GitHub Release
-        uses: actions/create-release@v1
+          persist-credentials: false
+      - name: Create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: ${{ steps.info.outputs.service }} v${{ steps.info.outputs.version }}
-          body: |
-            ## Changes
-            
-            ${{ steps.changelog.outputs.changelog }}
-            
-            ## Docker Image
-            
-            ```
-            docker pull sidpalas/${{ steps.info.outputs.service }}:${{ steps.info.outputs.version }}
-            ```
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
 ```
 
-**Changelog generation**: Uses `git log` to extract commits between the previous release tag and the current one. Formats as bullet list of commit messages.
+`--generate-notes` summarizes pull requests since the previous release of the repository, not specifically of this service; for per-service changelogs consider `googleapis/release-please-action` (current major tag: `v4`; it supports monorepo configuration through manifest files, which needs its own setup) or compose notes from `git log -- <service-dir>`. The archived `actions/create-release` action should not be used.
 
-**Release artifacts**: Could be extended to attach build artifacts, Kubernetes manifests, or deployment documentation.
+### Lesson 14.7: Repository chores
 
-## Part 3: Stale Issue and PR Management
+Reuse Chapter 9: `actions/stale` on a schedule for issue hygiene and Dependabot for `github-actions`, `docker` and the language ecosystems. The capstone does not need new code here. Remember that these workflows hold write permissions; pin the actions.
 
-### Repository Hygiene Automation
+### Lesson 14.8: Timing data and observability
 
-Open-source projects and active repositories accumulate stale issues and pull requests—items that have gone inactive but were never explicitly closed. Automated stale management keeps repositories clean without manual triage.
+GitHub's run page shows durations but not trends across runs. You can export workflow timings as traces to an observability platform. Honeycomb provides a build-events action; as verified from its README while preparing this guide:
 
-**Lifecycle**:
-1. Issue/PR open with no activity for 30 days → Add "stale" label and warning comment
-2. Stale item has activity → Remove "stale" label
-3. Stale item remains inactive for 7 more days → Close with explanation comment
+- The action has moved: it is now `honeycombio/gha-buildevents` (the old `kvrhdn/gha-buildevents@v1` used in the original notes is outdated), with a `v4` tag.
+- Required inputs are `apikey` and `dataset`; the status input is `status` (the old `job-status` is deprecated); `matrix-key` is an optional input for matrix builds.
+- It is used in the workflow whose timing you want to record, as a final step or job; the README's example is a single-job workflow.
 
-### Stale Workflow Implementation
+Read the README for the version you pin before adopting it; this guide did not run the action. The API key belongs in a secret, ideally an environment secret. Exported metadata may include repository, branch and commit information, so consider what leaves your boundary. For a no-service alternative, use the `gh run list --json` query from Chapter 10.
 
-```yaml
-name: Manage Stale Issues and PRs
+## 3. Mental model
 
-on:
-  schedule:
-    - cron: '0 0 * * *'  # Daily at midnight UTC
-  workflow_dispatch:  # Manual triggering for testing
+CI is a **courier** that never enters the building. It writes a delivery note ("run api-golang:1.0.9") on a notice board (the manifest in Git). The building's own concierge (Argo CD/Flux) reads the board and acts. The courier needs only access to the board, not keys to the building, and everything on the board has a history.
 
-jobs:
-  stale:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/stale@v9
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          
-          # Issue configuration
-          stale-issue-message: |
-            This issue has been inactive for 30 days and is being marked as stale.
-            
-            If this issue is still relevant, please comment to keep it open.
-            Otherwise, it will be automatically closed in 7 days.
-          close-issue-message: |
-            This issue was closed due to inactivity. If you believe this was closed
-            in error, please reopen or create a new issue with updated information.
-          days-before-issue-stale: 30
-          days-before-issue-close: 7
-          stale-issue-label: 'stale'
-          exempt-issue-labels: 'pinned,security,bug'
-          
-          # PR configuration
-          stale-pr-message: |
-            This pull request has been inactive for 30 days and is being marked as stale.
-            
-            Please update the PR or provide status. It will be closed in 7 days if inactive.
-          close-pr-message: |
-            This PR was closed due to inactivity. Please reopen with updates if still relevant.
-          days-before-pr-stale: 30
-          days-before-pr-close: 7
-          stale-pr-label: 'stale'
-          exempt-pr-labels: 'pinned,work-in-progress'
-          
-          # Operation limits
-          operations-per-run: 100  # API rate limit management
+## 4. Syntax breakdown
+
+| Syntax | Meaning |
+|---|---|
+| `on: workflow_call: inputs:` | Makes a workflow callable; inputs are typed |
+| `uses: ./.github/workflows/x.yml` on a job | Calls a reusable workflow (no `steps`, no `runs-on` on that job) |
+| `with:` on a calling job | Passes inputs; can use `matrix.*` |
+| `permissions: contents: write` | Required for pushing; also on the calling job |
+| `environment: ${{ inputs.environment }}` | Gate and scope secrets per environment |
+| `git push origin HEAD:$BRANCH` | Push the current commit to a named branch |
+| `git pull --rebase` | Rebase local commit onto the updated remote |
+| `gh release create --verify-tag --generate-notes` | Create a release from an existing tag |
+
+## 5. Practical example: the full loop, locally verifiable
+
+Run the pieces in a clone of your practice repository, without GitHub:
+
+```bash
+git checkout -b gitops-demo
+export IMAGE_REPO=ghcr.io/you/practice
+scripts/update-image-tag.sh staging services/go/api-golang 1.0.0-0003-abcdef1
+git --no-pager diff
+git checkout -- .                      # undo; no push needed locally
 ```
 
-### Configuration Considerations
+On GitHub, create the branch `gitops-demo`, then run **Update GitOps manifests** manually with `branch` left at its default and watch the commit appear on that branch.
 
-**Timing**:
-- **Schedule**: Daily checks balance responsiveness with API usage
-- **Stale threshold**: 30 days provides ample time for slow responses
-- **Close threshold**: 7 additional days gives warning period
+## 6. Execution walkthrough
 
-**Exempt labels**: Certain issues should never be automatically closed:
-- **pinned**: Core issues tracked long-term
-- **security**: Security issues require explicit resolution
-- **bug**: Confirmed bugs need intentional fixing
-- **work-in-progress**: PRs actively being developed (even if slowly)
-
-**Operations limit**: GitHub API has rate limits. The `operations-per-run` setting prevents hitting limits if you have many stale items. The workflow runs daily, so 100 operations/day handles most repositories.
-
-**Customizing messages**: Messages should be friendly and explanatory. Include instructions for keeping items open and provide context for closure.
-
-### Monitoring and Metrics
-
-Track stale management effectiveness:
-- Number of items marked stale
-- Number of items closed
-- Number of items revived (stale label removed due to activity)
-- False positive rate (items reopened after automatic closure)
-
-Adjust thresholds based on these metrics and community feedback.
-
-## Part 4: Performance Monitoring and Observability
-
-### Exporting CI/CD Metrics
-
-Understanding workflow performance helps optimize CI/CD pipelines. Exporting timing data to observability platforms enables:
-- Identifying slow workflows
-- Tracking performance trends over time
-- Detecting regressions
-- Capacity planning
-
-**Metrics to track**:
-- Workflow duration (total time from trigger to completion)
-- Job duration (time for individual jobs)
-- Step duration (time for individual steps)
-- Queue time (time waiting for runner)
-- Cache hit rate
-- Test counts and failure rates
-
-### Honeycomb Integration Example
-
-```yaml
-name: Export Workflow Metrics
-
-on:
-  workflow_run:
-    workflows: ["Test Workflow", "Build and Push Images"]
-    types: [completed]
-
-jobs:
-  export-metrics:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Get workflow run details
-        id: workflow
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const run = await github.rest.actions.getWorkflowRun({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.payload.workflow_run.id
-            });
-            
-            return {
-              workflow_name: run.data.name,
-              status: run.data.conclusion,
-              duration_ms: new Date(run.data.updated_at) - new Date(run.data.created_at),
-              trigger: run.data.event,
-              branch: run.data.head_branch
-            };
-            
-      - name: Get job details
-        id: jobs
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const jobs = await github.rest.actions.listJobsForWorkflowRun({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.payload.workflow_run.id
-            });
-            
-            return jobs.data.jobs.map(job => ({
-              job_name: job.name,
-              status: job.conclusion,
-              duration_ms: new Date(job.completed_at) - new Date(job.started_at),
-              runner: job.runner_name
-            }));
-            
-      - name: Export to Honeycomb
-        env:
-          HONEYCOMB_API_KEY: ${{ secrets.HONEYCOMB_API_KEY }}
-          HONEYCOMB_DATASET: github-actions
-        run: |
-          curl https://api.honeycomb.io/1/events/$HONEYCOMB_DATASET \
-            -X POST \
-            -H "X-Honeycomb-Team: $HONEYCOMB_API_KEY" \
-            -d @- <<EOF
-          {
-            "workflow_name": "${{ fromJSON(steps.workflow.outputs.result).workflow_name }}",
-            "status": "${{ fromJSON(steps.workflow.outputs.result).status }}",
-            "duration_ms": ${{ fromJSON(steps.workflow.outputs.result).duration_ms }},
-            "trigger": "${{ fromJSON(steps.workflow.outputs.result).trigger }}",
-            "branch": "${{ fromJSON(steps.workflow.outputs.result).branch }}",
-            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
-```
-
-**workflow_run trigger**: Executes after specified workflows complete, allowing metric collection without modifying the monitored workflows.
-
-**GitHub Script action**: Queries GitHub API for workflow and job details, parsing timing information.
-
-**Honeycomb API**: Sends structured events to Honeycomb for analysis and visualization.
-
-### Using Namespace for Build Performance
-
-The course mentions Namespace, a platform offering remote builders optimized for CI/CD workloads. Benefits include:
-- **Faster builds**: Dedicated compute with large cache volumes
-- **Better caching**: Persistent layer cache across runs
-- **Multi-architecture**: Native ARM and x86 builders
-- **Cost optimization**: Pay per build rather than per runner minute
-
-**Integration example** (simplified):
-
-```yaml
-- name: Build with Namespace
-  uses: namespacelabs/nscloud-setup@v0
-  with:
-    token: ${{ secrets.NAMESPACE_TOKEN }}
-    
-- name: Build and push
-  run: |
-    ns build \
-      --context ${{ matrix.service }} \
-      --tag ${{ steps.image-tag.outputs.image_tag }} \
-      --platform linux/amd64,linux/arm64 \
-      --push
-```
-
-Namespace's persistent caching eliminates the need for GitHub Actions cache configuration, and parallel native architecture builds are faster than QEMU emulation.
-
-## Part 5: Course Conclusion and Next Steps
-
-### What We've Built
-
-Over the course of this capstone project, we've created a production-ready CI/CD automation system comprising:
-
-**Core CI Workflows**:
-1. **Test Workflow**: Multi-language testing with intelligent filtering, matrix strategies, and conditional toolchain setup
-2. **Build/Push Workflow**: Container image builds with environment-specific versioning, multi-architecture support, and automated registry publishing
-
-**Deployment Workflows**:
-3. **GitOps Manifest Updates**: Automated Kubernetes manifest version updates with retry logic and concurrency control
-4. **Release Automation**: Tag-based releases with changelog generation and GitHub release creation
-
-**Operational Workflows**:
-5. **Stale Management**: Automated issue and PR lifecycle management for repository hygiene
-6. **Performance Monitoring**: Workflow metrics export to observability platforms
-
-**Supporting Infrastructure**:
-- Composite actions for shared setup logic
-- Task-based abstraction for cross-service consistency
-- Act-based local testing for rapid development
-- Path filtering for monorepo optimization
-- Matrix strategies for parallel execution
-
-### Key Patterns and Principles
-
-**1. Convention over Configuration**
-
-By establishing conventions (directory structure, task interfaces, tagging patterns), we minimized workflow complexity. New services integrate seamlessly without workflow modifications.
-
-**2. Reusability through Composition**
-
-Composite actions, reusable workflows, and shared Task definitions eliminate duplication and centralize maintenance.
-
-**3. Fail-Safe Design**
-
-Retry logic, concurrency controls, and conditional execution ensure workflows handle edge cases gracefully.
-
-**4. Local-First Development**
-
-Act enables testing workflows locally, dramatically shortening feedback loops and reducing reliance on cloud CI resources during development.
-
-**5. Intelligent Optimization**
-
-Path filtering, caching strategies, and matrix parallelization optimize CI performance without sacrificing correctness.
-
-**6. Observability and Feedback**
-
-Clear commit messages, comprehensive logging, metric export, and GitHub release integration provide visibility into the deployment pipeline.
-
-### Extending the System
-
-**Potential enhancements**:
-
-**Testing**:
-- Integration tests between services
-- End-to-end testing in ephemeral environments
-- Visual regression testing for frontend
-- Load testing automation
-
-**Security**:
-- Vulnerability scanning (Snyk, Trivy)
-- Dependency update automation (Dependabot, Renovate)
-- Secret scanning and rotation
-- SBOM (Software Bill of Materials) generation
-
-**Deployment**:
-- Progressive delivery with canary/blue-green deployments
-- Automated rollback on failure detection
-- Multi-cluster deployments
-- Compliance and policy checks (OPA/Gatekeeper)
-
-**Developer Experience**:
-- PR preview environments
-- Workflow status notifications (Slack, email)
-- Custom GitHub CLI extensions
-- Local development environment automation
-
-### Best Practices Summary
-
-**Workflow Design**:
-- Keep workflows focused and composable
-- Use descriptive names for jobs and steps
-- Pin action versions for reproducibility
-- Document complex logic with comments
-
-**Security**:
-- Use secrets for sensitive data
-- Minimize token permissions (GITHUB_TOKEN scope)
-- Pin dependencies to commit SHAs
-- Review third-party actions before using
-
-**Performance**:
-- Cache aggressively (dependencies, build artifacts)
-- Filter to avoid unnecessary work
-- Parallelize independent work with matrices
-- Use appropriate runner types (standard vs. larger)
-
-**Maintainability**:
-- Extract common logic to composite actions
-- Use conventional naming and structure
-- Keep workflows under version control
-- Test changes locally before pushing
-
-**Collaboration**:
-- Document workflows in README
-- Include examples and troubleshooting guides
-- Establish team conventions
-- Provide feedback mechanisms
-
-### Advanced Topics to Explore
-
-**1. Self-Hosted Runners**
-
-For sensitive workloads or specialized hardware requirements, self-hosted runners provide:
-- Complete environment control
-- Access to internal resources
-- Custom tooling and dependencies
-- Potential cost savings at scale
-
-**2. Matrix Strategy Advanced Patterns**
-
-- Dynamic matrix generation from file contents
-- Matrix includes for special cases
-- Matrix excludes to prevent specific combinations
-- Nested matrices for multi-dimensional testing
-
-**3. Composite Actions vs. Reusable Workflows**
-
-Understanding when to use each:
-- **Composite actions**: Share steps within jobs
-- **Reusable workflows**: Share entire jobs/workflows
-- Both can accept inputs and outputs
-- Reusable workflows can use secrets from calling workflow
-
-**4. Custom Actions**
-
-Building JavaScript/TypeScript or Docker-based actions:
-- Full programmatic control
-- Complex logic impossible with bash
-- Published to Marketplace for community use
-- Maintained separately from workflows
-
-**5. GitHub App Integration**
-
-Creating GitHub Apps for enhanced automation:
-- Fine-grained permissions beyond GITHUB_TOKEN
-- Cross-repository operations
-- Webhook-based triggering
-- Richer API access
-
-**6. Workflow Optimization Techniques**
-
-- Job output sharing strategies
-- Artifact lifecycle management
-- Conditional job dependencies
-- Workflow concurrency patterns
-
-### Resources for Continued Learning
-
-**Official Documentation**:
-- GitHub Actions docs: docs.github.com/actions
-- Workflow syntax reference
-- Security hardening guide
-- Action development guide
-
-**Community Resources**:
-- GitHub Actions Marketplace: github.com/marketplace?type=actions
-- Awesome GitHub Actions: github.com/sdras/awesome-actions
-- r/github subreddit
-- GitHub Community Forum
-
-**Advanced Courses and Content**:
-- GitHub Certifications (Actions Developer)
-- Platform-specific deployment guides
-- Language/framework-specific CI/CD patterns
-- Security-focused content (SLSA, supply chain security)
-
-**Real-World Examples**:
-- Open-source project workflows
-- GitHub's own repositories
-- Language/framework official repos
-- Industry-specific examples
-
-### Final Thoughts
-
-GitHub Actions represents a paradigm shift in CI/CD tooling—bringing automation into the same platform as your code, reviews, and collaboration. The workflows we've built demonstrate professional practices applicable to any project size, from personal side projects to enterprise applications.
-
-The patterns you've learned—matrix strategies, composite actions, intelligent filtering, local testing—are transferable to other CI/CD platforms and automation tools. The mindset of treating CI/CD as code, versioning it, testing it, and continuously improving it applies universally.
-
-**Key takeaways**:
-
-1. **Start simple, iterate**: Begin with basic workflows and add sophistication as needs emerge
-2. **Test locally**: Act and similar tools save time and frustration
-3. **Embrace conventions**: Consistency across services multiplies benefits
-4. **Optimize thoughtfully**: Measure before optimizing; premature optimization wastes effort
-5. **Document**: Future you and teammates will thank you
-6. **Share knowledge**: Contribute to the community through blog posts, actions, and examples
-
-**The journey continues**: CI/CD is never "done"—it evolves with your project, team, and tools. Stay curious, keep learning, and continually refine your automation. The time invested in robust CI/CD pays dividends through faster delivery, fewer bugs, and happier developers.
-
-Thank you for completing this comprehensive GitHub Actions course. You now have the knowledge and practical experience to build world-class CI/CD automation. Go forth and automate!
-
-## Appendix: Complete Workflow File Reference
-
-### Test Workflow (Complete)
-
-```yaml
-name: Test Workflow
-on:
-  workflow_dispatch:
-  pull_request:
-  push:
-    branches: [main, develop]
-
-jobs:
-  filter:
-    runs-on: ubuntu-latest
-    outputs:
-      services: ${{ steps.filter.outputs.changes }}
-    steps:
-      - uses: actions/checkout@4.2.2
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
-        id: filter
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          filters: .github/utils/file-filters.yaml
-
-  test:
-    needs: filter
-    if: needs.filter.outputs.services != '[]' && needs.filter.outputs.services != ''
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        service: ${{ fromJSON(needs.filter.outputs.services) }}
-    steps:
-      - uses: actions/checkout@4.2.2
-      - uses: actions/setup-node@4.4.0
-        if: startsWith(matrix.service, 'services/node') || startsWith(matrix.service, 'services/react')
-        with:
-          node-version-file: ${{ matrix.service }}/package.json
-          cache: npm
-          cache-dependency-path: ${{ matrix.service }}/package-lock.json
-      - uses: actions/setup-go@5.5.0
-        if: startsWith(matrix.service, 'services/go')
-        with:
-          go-version-file: ${{ matrix.service }}/go.mod
-          cache-dependency-path: ${{ matrix.service }}/go.sum
-      - uses: snok/install-poetry@1.4.1
-        if: startsWith(matrix.service, 'services/python')
-      - uses: actions/setup-python@5.6.0
-        if: startsWith(matrix.service, 'services/python')
-        with:
-          python-version-file: ${{ matrix.service }}/pyproject.toml
-          cache: poetry
-          cache-dependency-path: ${{ matrix.service }}/poetry.lock
-      - uses: ./.github/actions/setup-dependencies
-      - name: Install dependencies
-        working-directory: ${{ matrix.service }}
-        run: task installci
-      - name: Run tests
-        working-directory: ${{ matrix.service }}
-        run: task test
-```
-
-### Build and Push Workflow (Complete)
-
-```yaml
-name: Build and Push Images
-on:
-  workflow_dispatch:
-    inputs:
-      service:
-        type: choice
-        options:
-          - services/node/api-node
-          - services/go/api-golang
-          - services/react/client-react
-          - services/python/load-generator
-          - services/other/migrator
-  push:
-    branches: [main]
-    paths: ['services/**']
-  push:
-    tags: ['*@[0-9]+.[0-9]+.[0-9]+']
-
-jobs:
-  filter:
-    runs-on: ubuntu-latest
-    outputs:
-      services: ${{ steps.set-output.outputs.services }}
-      environment: ${{ steps.set-output.outputs.environment }}
-    steps:
-      - uses: actions/checkout@4.2.2
-      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
-        id: filter
-        if: github.ref_type != 'tag'
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          filters: .github/utils/file-filters.yaml
-      - name: Set output
-        id: set-output
-        run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            TAG_NAME="${{ github.ref_name }}"
-            SERVICE="${TAG_NAME%@*}"
-            echo "services=[\"$SERVICE\"]" >> $GITHUB_OUTPUT
-            echo "environment=production" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "services=[\"${{ github.event.inputs.service }}\"]" >> $GITHUB_OUTPUT
-            echo "environment=development" >> $GITHUB_OUTPUT
-          else
-            echo "services=${{ steps.filter.outputs.changes }}" >> $GITHUB_OUTPUT
-            echo "environment=staging" >> $GITHUB_OUTPUT
-          fi
-
-  build-push:
-    needs: filter
-    if: needs.filter.outputs.services != '[]' && needs.filter.outputs.services != ''
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        service: ${{ fromJSON(needs.filter.outputs.services) }}
-    steps:
-      - uses: actions/checkout@4.2.2
-        with:
-          fetch-depth: 0
-      - uses: ./.github/actions/setup-dependencies
-      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
-        if: env.ACT != 'true'
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf
-      - uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db
-      - name: Generate image tag
-        id: image-tag
-        working-directory: ${{ matrix.service }}
-        env:
-          ENVIRONMENT: ${{ needs.filter.outputs.environment }}
-        run: |
-          if [ "$ENVIRONMENT" = "production" ]; then
-            VERSION=$(task utils:generate-version)
-            IMAGE_TAG=$(task utils:generate-version-tag)
-          else
-            VERSION=$(task utils:generate-version-extended)
-            IMAGE_TAG=$(task utils:generate-version-tag-extended)
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-      - uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75
-        with:
-          context: ${{ matrix.service }}
-          push: ${{ env.ACT != 'true' }}
-          tags: ${{ steps.image-tag.outputs.image_tag }}
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-```
-
-This comprehensive final chapter completes the course, covering all remaining workflows and providing guidance for continued growth in CI/CD automation!
+A push to `main` that changes only `services/go/api-golang`:
+
+1. Chapter 13's `plan` job computes `[{"service":"services/go/api-golang","name":"api-golang","version":"1.0.9-0047-452cc9a"}]`; `build` pushes the image.
+2. `deploy` starts after `build` succeeds. Its matrix has one leg. It calls `gitops-update.yml` with environment `staging`.
+3. In the called workflow, the `update-manifest` job (environment `staging`) checks out `main`, runs the script to rewrite the Go line in `deploy/staging/images.yaml`, commits as the bot and pushes.
+4. If another leg pushed first, the push is rejected; the script rebases and retries.
+5. The Argo CD / Flux agent (in a real setup) sees the commit and rolls out the new image. Because the push used `GITHUB_TOKEN`, no new workflow run is triggered.
+
+A release tag `services/go/api-golang@1.0.10` follows the same path to `deploy/production/images.yaml`, but `update-manifest` waits for the reviewers configured on the `production` environment, and `release.yml` also creates the GitHub release.
+
+## 7. Common mistakes
+
+| Mistake | Effect | Fix |
+|---|---|---|
+| No `workflow_call` trigger | `uses:` cannot call it | Add it |
+| `needs.build.outputs[matrix.service]` | Invalid; matrix outputs collide | Compute data in `plan`; pass via `matrix.include` |
+| Missing `contents: write` (workflow and calling job) | 403 on push | Grant it where needed only |
+| Expecting the bot's push to trigger CI | Nothing runs | Use an App token / deploy key if required |
+| `[skip ci]` as a loop guard for `GITHUB_TOKEN` pushes | Unnecessary | Remove, or keep deliberately for other tokens |
+| Committing inside the retry loop | Duplicate commits | Commit once |
+| Pushing straight to a protected `main` | Rejected | Separate manifests repo/bypass rule, or PR flow |
+| Interpolating inputs into commit-message scripts | Injection | `env:` plus validation |
+| `secrets: inherit` by habit | Over-sharing | Not needed here |
+| Using `actions/create-release` | Archived | `gh release create` |
+| Using `kvrhdn/gha-buildevents@v1` | Outdated; moved | `honeycombio/gha-buildevents`, read the README |
+
+## 8. Security considerations
+
+- **Trust in the manifest repository.** Whoever can push to it can change production. Protect its branches like production, and prefer a dedicated credential (GitHub App or deploy key) over a personal access token.
+- **Approvals.** Put `environment: production` with required reviewers on the job that writes production manifests.
+- **Validated writes.** The script accepts only known environments, a path-shaped service, a version-shaped string and a GHCR-shaped repository. That keeps `sed` safe.
+- **Least privilege.** Only the deploy job has `contents: write`; builds have `packages: write`; everything else is read-only.
+- **Observability exports** leak metadata to a third party; store API keys as secrets.
+- **Loop guards.** Pushes with `GITHUB_TOKEN` don't trigger workflows. If you switch to a token that does, protect against infinite loops (path filters, actor checks).
+
+## 9. Hands-on exercise
+
+**Goal:** close the loop in your practice repository.
+
+1. Add `deploy/staging/images.yaml` and `deploy/production/images.yaml` (with your owner/repo), `scripts/update-image-tag.sh` and `scripts/git-commit-push.sh` (executable). Run the script locally as in Section 5, and also try the three rejected cases (bad service, missing marker, bad version).
+2. Create the branch `gitops-demo` on GitHub. Add `gitops-update.yml`, `release.yml` and the `deploy` job from Lesson 14.5, merge to `main`, and `actionlint`.
+3. Create a `staging` and a `production` environment (**Settings → Environments**). Add a required reviewer (yourself) to `production`.
+4. Run **Update GitOps manifests** manually: staging, `services/go/api-golang`, version `1.0.9-0047-abcdef1`, branch `gitops-demo`. Confirm a bot commit on that branch.
+5. Run it twice at once with different services (two browser tabs or `gh workflow run` twice) and confirm both commits land (rebase-and-retry).
+6. Push a release tag, for example `services/go/api-golang@1.0.0`. Approve the production deployment, and confirm the release and the production manifest change.
+7. Review the whole capstone with the checklist in Chapter 11.
+
+**Success looks like:** two bot commits on the demo branch, a production approval prompt, and a GitHub release for the tag.
+
+**If it fails:** `403` on push → `contents: write` missing at workflow or calling job; "no line tagged" → marker comment missing or path differs; called workflow cannot be found → file path or missing `workflow_call`; production job not waiting → environment has no reviewers.
+
+## 10. Verification checklist
+
+- [ ] `gitops-update.yml` has `workflow_call` and typed inputs.
+- [ ] The deploy matrix uses data from `plan`, not from build outputs.
+- [ ] `contents: write` appears only on the deploy job and the called job.
+- [ ] Production changes require an environment approval.
+- [ ] The script rejects bad inputs.
+- [ ] No `[skip ci]`-style assumptions about `GITHUB_TOKEN` pushes remain.
+- [ ] The Honeycomb (or any third-party) action, if used, is pinned and its README was read.
+
+## 11. Knowledge check
+
+1. In GitOps, what does CI change, and who applies it?
+2. Why can pushes made with `GITHUB_TOKEN` not trigger workflows, and when would you need a different credential?
+3. Why does `needs.build.outputs[matrix.service]` not work?
+4. Why must the calling job grant `contents: write` too?
+5. How does the retry loop avoid duplicate commits and thundering herds?
+6. Where do production approvals come from when a reusable workflow is called?
+
+<details>
+<summary>Answers</summary>
+
+1. CI edits a manifest in Git; an in-environment agent applies it.
+2. GitHub blocks it to prevent recursion. Use an App token or deploy key if downstream workflows must run.
+3. Matrix legs share one output namespace and cannot be indexed by leg.
+4. A called workflow's permissions can't exceed the caller's.
+5. It commits once before the loop and uses exponential backoff plus random jitter.
+6. The `environment:` declared in the called job and its protection rules.
+</details>
+
+## 12. Key takeaways
+
+- GitOps splits "decide" (CI edits Git) from "apply" (agent in the environment).
+- A reusable workflow needs `workflow_call`; permissions flow caller → called.
+- Compute shared data once (plan) and reuse it for build and deploy.
+- Validate every value that reaches a shell or `sed`.
+- Treat the manifest repository and production environments as production.
+
+## 13. Where you have arrived
+
+You now have, across Chapters 1–14: the mental model (events → jobs → steps → runners), the feature set (outputs, secrets, matrices, caches, artifacts, OIDC, concurrency), reuse (marketplace actions, composite actions, reusable workflows), debugging habits, a best-practice checklist, and a capstone: **test only what changed → build and version images → update GitOps manifests → release → chores → timing data**.
+
+Natural next steps: run an Argo CD or Flux agent against a local cluster to see the other half of GitOps; add image signing and provenance; replace the simplified manifest with Kustomize overlays; add reusable-workflow versioning across several repositories; try self-hosted ephemeral runners in a private repository.
+
+## Sources and further reading
+
+- Original notes: `git show master:14_remaining_workflows_conclusion.md`. Corrections: GitOps workflow without `workflow_call`; invalid `needs.build-push.outputs[matrix.service]`; missing `contents: write`; incorrect `[skip ci]` rationale; inputs interpolated into shell; archived `create-release` action; stale and outdated Honeycomb action (`kvrhdn/gha-buildevents@v1`, `job-status`); the repeated Honeycomb setup (also in Chapter 10); and the appendix that duplicated Chapters 12–13 (removed). The conclusion/resource lists were condensed.
+- Official docs: [Reusable workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/reusable-workflows) · [Authenticate with GITHUB_TOKEN](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token) · [Workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+- Tools: [Argo CD](https://argo-cd.readthedocs.io/) · [Flux](https://fluxcd.io/) · [honeycombio/gha-buildevents](https://github.com/honeycombio/gha-buildevents) · [googleapis/release-please-action](https://github.com/googleapis/release-please-action)
+- Verification note: `scripts/update-image-tag.sh` was exercised in a scratch repository (results in Lesson 14.2). The workflows in this chapter were not run on GitHub.

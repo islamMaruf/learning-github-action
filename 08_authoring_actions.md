@@ -1,1032 +1,435 @@
-# Chapter 8: Authoring Actions - Building Custom Reusable Logic
+# Chapter 8: Authoring Reusable Logic: Composite Actions, Reusable Workflows, JavaScript and Container Actions
 
-## Overview
+> **Level:** intermediate → advanced · **Time:** 4 hours · **Prerequisites:** [Chapters 5–7](05_core_features.md)
+> **Next:** [Chapter 9: Common Workflows](09_common_workflows.md)
 
-In Chapter 7, you learned how to consume actions from the GitHub Marketplace. But what happens when the action you need doesn't exist? Or when you have organization-specific logic that needs to be reused across multiple workflows?
+## Learning objectives
 
-This chapter explores **authoring your own actions**—creating custom, reusable units of logic that can be shared across workflows, repositories, and even organizations.
+After this chapter you can:
 
-GitHub Actions provides **four mechanisms** for writing and reusing logic:
-1. **Composite actions** - Bundle steps into reusable components
-2. **Reusable workflows** - Share entire workflow definitions
-3. **JavaScript/TypeScript actions** - Full-featured actions with GitHub's native runtime
-4. **Container actions** - Actions in any language, packaged as Docker containers
+- Build a **composite action** and use it from a workflow.
+- Build a **reusable workflow** with inputs, secrets and outputs, and call it.
+- Describe what JavaScript and container actions are, and when they are worth their cost.
+- Choose between the four mechanisms using a decision table.
+- Use workflow commands correctly (and avoid the removed ones).
+- Share actions privately, within an organization, or publicly.
 
-By the end of this chapter, you'll understand:
-- When to use each authoring approach
-- How to structure and build custom actions
-- Input/output mechanisms for passing data
-- Publishing strategies (public marketplace vs. private repos)
-- Decision frameworks for choosing the right tool
+## 1. Problem statement
 
-## Composite Actions: The Easiest Starting Point
+By the time you have five repositories, the same 30 lines (checkout, set up Node, restore cache, build, scan) exist in all of them. Copy-paste drifts: a fix in one place is missing in four others. GitHub offers four ways to define logic once and reuse it, each with different power and cost.
 
-**Definition**: Composite actions are the **simplest way** to bundle multiple steps into a single reusable action.
+## 2. Core explanation
 
-**Use case**: You have a sequence of steps you're copying across workflows and want to centralize the logic.
+### The four mechanisms at a glance
 
-### Anatomy of a Composite Action
+| Mechanism | Reuses | Defined in | Runs as | Language |
+|---|---|---|---|---|
+| **Composite action** | A sequence of *steps* | `action.yml` | Steps inside the caller's job (same runner, same workspace) | YAML + shell/`uses` |
+| **Reusable workflow** | Whole *jobs* | A workflow file with `on: workflow_call` | New job(s) on their own runner(s) | YAML |
+| **JavaScript action** | Arbitrary logic via Node | `action.yml` + JS | A Node process on the runner | JS/TS |
+| **Container action** | Arbitrary logic in any language | `action.yml` + Dockerfile | A Docker container (Linux runners only) | Anything |
 
-**Required file**: `action.yml` (or `action.yaml`)
+### Lesson 8.1: Composite actions
 
-**Structure**:
+A composite action packages steps. Create `.github/actions/setup-app/action.yml`:
+
 ```yaml
-name: 'My Composite Action'
-description: 'Description of what this action does'
-author: 'Your Name'
+name: Setup app
+description: Install Node and dependencies with caching
 
 inputs:
-  who-to-greet:
-    description: 'Person to greet'
-    required: true
-    default: 'World'
+  node-version:
+    description: Node.js version
+    required: false
+    default: '22'
 
 outputs:
-  random-number:
-    description: 'A random number'
-    value: ${{ steps.random-step.outputs.random-number }}
+  cache-hit:
+    description: Whether the npm cache was restored
+    value: ${{ steps.node.outputs.cache-hit }}
 
 runs:
-  using: 'composite'
+  using: composite
   steps:
-    - name: Greet someone
-      run: echo "Hello, ${{ inputs.who-to-greet }}!"
-      shell: bash
-    
-    - name: Generate random number
-      id: random-step
-      run: echo "random-number=$RANDOM" >> $GITHUB_OUTPUT
-      shell: bash
+    - id: node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+    - name: Install dependencies
+      shell: bash                  # required for every run step in a composite action
+      run: npm ci
 ```
 
-**Key sections**:
-- **`inputs:`** - Define parameters the action accepts
-- **`outputs:`** - Define values the action produces
-- **`runs.using: composite`** - Declares this as a composite action
-- **`runs.steps:`** - The actual steps to execute
+Use it from a workflow in the same repository (checkout must happen first so the file exists on the runner):
 
-### Creating a Composite Action
-
-**Step 1: Create directory structure**
-
-```
-.github/
-└── actions/
-    └── hello-world/
-        └── action.yml
-```
-
-**Convention**: Store actions in `.github/actions/` directory for discoverability.
-
-**Step 2: Define action.yml**
-
-```yaml
-name: 'Hello World Composite'
-description: 'Greets someone and generates a random number'
-
-inputs:
-  who-to-greet:
-    description: 'Who to greet'
-    required: true
-
-outputs:
-  random-number:
-    description: 'Random number generated'
-    value: ${{ steps.generate-random.outputs.random-number }}
-
-runs:
-  using: 'composite'
-  steps:
-    - name: Greet
-      run: echo "Hello, ${{ inputs.who-to-greet }}!"
-      shell: bash
-    
-    - name: Generate random
-      id: generate-random
-      run: echo "random-number=$RANDOM" >> $GITHUB_OUTPUT
-      shell: bash
-```
-
-**Step 3: Use in workflow**
-
-```yaml
-name: Use Composite Action
-
-on: workflow_dispatch
-
-jobs:
-  job1:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4  # REQUIRED to access action code
-      
-      - name: Call composite action
-        id: my-action
-        uses: ./.github/actions/hello-world
-        with:
-          who-to-greet: 'from Job 1'
-      
-      - name: Show output
-        run: echo "Random: ${{ steps.my-action.outputs.random-number }}"
-
-  job2:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Call same action with different input
-        uses: ./.github/actions/hello-world
-        with:
-          who-to-greet: 'from Job 2'
-```
-
-**Critical requirement**: Must run `actions/checkout` **before** using composite action, otherwise the code won't be available on the runner.
-
-### Composite Action Features
-
-**Inputs**:
-- Access via `${{ inputs.input-name }}`
-- Can have default values
-- Can be required or optional
-- Type-checked at workflow syntax level
-
-**Outputs**:
-- Must reference output from a specific step (via `steps.step-id.outputs.output-name`)
-- Available to calling workflow via `steps.action-step-id.outputs.output-name`
-
-**Limitations**:
-- Cannot use `secrets` context directly (must be passed as inputs)
-- Cannot define environment variables at action level
-- All steps must specify `shell` (bash, pwsh, python, etc.)
-
-### When to Use Composite Actions
-
-**Good fit**:
-- Reusing 3-10 steps across multiple workflows
-- Organization-specific setup sequences (install dependencies, configure tools)
-- Common validation patterns (lint, test, security scan)
-- Pre/post job setup routines
-
-**Not ideal**:
-- Single-step operations (just use inline `run:`)
-- Complex logic requiring external dependencies (use JavaScript/container actions)
-- Need for fine-grained control over execution environment
-
-## Reusable Workflows: Standardizing Entire Workflows
-
-**Definition**: Reusable workflows allow you to call an entire workflow as a **job** within another workflow.
-
-**Key distinction**: While composite actions are **steps**, reusable workflows are **jobs**.
-
-### Anatomy of a Reusable Workflow
-
-**Source workflow** (the one being called):
-
-```yaml
-name: Reusable Deploy Workflow
-
-on:
-  workflow_call:  # This makes it reusable
-    inputs:
-      environment:
-        description: 'Environment to deploy to'
-        required: true
-        type: string
-    secrets:
-      deploy-key:
-        description: 'Deployment key'
-        required: true
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Deploy
-        run: |
-          echo "Deploying to ${{ inputs.environment }}"
-          echo "Using key: ${{ secrets.deploy-key }}"
-```
-
-**Caller workflow** (the one calling it):
-
-```yaml
-name: Call Reusable Workflow
-
-on: workflow_dispatch
-
-jobs:
-  deploy-staging:
-    uses: ./.github/workflows/deploy-reusable.yml
-    with:
-      environment: staging
-    secrets:
-      deploy-key: ${{ secrets.STAGING_DEPLOY_KEY }}
-  
-  deploy-production:
-    uses: ./.github/workflows/deploy-reusable.yml
-    with:
-      environment: production
-    secrets:
-      deploy-key: ${{ secrets.PRODUCTION_DEPLOY_KEY }}
-```
-
-### Key Features of Reusable Workflows
-
-#### The `workflow_call` Trigger
-
-**Purpose**: Marks a workflow as reusable (callable from other workflows).
-
-**Syntax**:
-```yaml
-on:
-  workflow_call:
-    inputs:
-      # ... input definitions
-    secrets:
-      # ... secret definitions
-```
-
-**Without this trigger**: Workflow cannot be called from another workflow.
-
-#### Inputs for Reusable Workflows
-
-**Definition**:
-```yaml
-on:
-  workflow_call:
-    inputs:
-      environment-name:
-        description: 'Target environment'
-        required: true
-        type: string  # string, boolean, number
-      debug-mode:
-        description: 'Enable debug logging'
-        required: false
-        type: boolean
-        default: false
-```
-
-**Types**: `string`, `boolean`, `number`
-
-**Accessing inputs**:
 ```yaml
 steps:
-  - run: echo "Environment: ${{ inputs.environment-name }}"
+  - uses: actions/checkout@v5
+  - uses: ./.github/actions/setup-app
+    with:
+      node-version: '22'
+  - run: npm test
 ```
 
-#### Secrets for Reusable Workflows
+Facts to remember:
 
-**Definition** (in source workflow):
+- Every `run:` step needs an explicit `shell:`.
+- Inputs arrive as `${{ inputs.name }}`; define them in `action.yml`. A composite action **cannot read the `secrets` context**; the caller passes secrets in as inputs (`with: token: ${{ secrets.TOKEN }}`).
+- Outputs must be declared in `outputs:` with a `value:` that points at a step output.
+- Composite actions appear as a *single step* in the caller's log (the inner steps are expandable), run on the caller's runner and see its filesystem and environment variables.
+- They can call other actions with `uses:`, and `if:` works inside them.
+- They cannot declare `runs-on`, `services` or `container`; those belong to jobs.
+
+Pass inputs to scripts through `env:` to avoid injection (Chapter 5):
+
 ```yaml
+- shell: bash
+  env:
+    NAME: ${{ inputs.who-to-greet }}
+  run: echo "Hello, $NAME"
+```
+
+### Lesson 8.2: Reusable workflows
+
+A reusable workflow is a normal workflow file with a `workflow_call` trigger. `.github/workflows/reusable-test.yml`:
+
+```yaml
+name: Reusable test
+
 on:
   workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version
+        type: string
+        required: false
+        default: '22'
     secrets:
-      api-key:
-        description: 'API key for service'
-        required: true
+      NPM_TOKEN:
+        required: false
+    outputs:
+      result:
+        description: Test outcome
+        value: ${{ jobs.test.outputs.result }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    outputs:
+      result: ${{ steps.done.outputs.result }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm test
+      - id: done
+        run: echo "result=passed" >> "$GITHUB_OUTPUT"
 ```
 
-**Passing secrets** (from caller):
+Call it. Note that the **job** has `uses:` and no `steps:` or `runs-on:`:
+
 ```yaml
+name: CI
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
-  call-workflow:
-    uses: ./.github/workflows/reusable.yml
-    secrets:
-      api-key: ${{ secrets.MY_API_KEY }}
-```
-
-**Important limitation**: Only **repository-level** and **organization-level** secrets can be passed explicitly.
-
-#### Environment Secret Inheritance
-
-**Problem**: Environment secrets cannot be passed like repository secrets.
-
-**Solution**: Use `inherit` keyword.
-
-**Example**:
-```yaml
-jobs:
-  deploy-staging:
-    uses: ./.github/workflows/deploy.yml
+  unit:
+    uses: ./.github/workflows/reusable-test.yml     # same repository, same commit
     with:
-      environment: staging
-    secrets: inherit  # Inherits ALL secrets from staging environment
+      node-version: '22'
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}           # explicit is better than inherit
+
+  report:
+    needs: unit
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "unit tests ${{ needs.unit.outputs.result }}"
 ```
 
-**Without `secrets: inherit`**: Environment secrets are NOT available to reusable workflow.
+From another repository: `uses: my-org/shared-workflows/.github/workflows/reusable-test.yml@<tag-or-SHA>`. The same pinning advice applies as for actions. The repository must allow access (public, or internal/private with the "Actions → Access" setting enabled for sharing).
 
-### Referencing Reusable Workflows
+Facts to remember:
 
-**Option 1: Relative path** (same repository):
+- Inputs have types (`string`, `number`, `boolean`); secrets are declared separately.
+- `secrets: inherit` passes all of the caller's accessible secrets to the called workflow. It is convenient but broad; use it only within one organization where you control the called workflow.
+- The called workflow's permissions can be **no broader** than the caller's token permission; the caller's `permissions:` caps it.
+- Reusable workflows can be nested, but only to a limited depth, and a caller job cannot combine `uses:` with its own `steps:`. Check the [reusable workflows docs](https://docs.github.com/en/actions/reference/workflows-and-actions/reusable-workflows) for current limits.
+- **Environment secrets:** a job reads environment secrets only when *that job* declares `environment: <name>`. If the called workflow's job needs staging/production secrets, declare `environment:` inside the called job (for example from an input). Do not assume that a caller's environment makes its secrets available to the called workflow; test this on a throwaway environment.
+- Matrix and `needs` work on the calling job, so a caller can run a reusable workflow once per service.
+
+### Lesson 8.3: Composite action vs. reusable workflow
+
+| Question | Composite action | Reusable workflow |
+|---|---|---|
+| Unit of reuse | Steps | Jobs (including runner choice, matrix, services, environments) |
+| Runs on | Caller's runner and workspace | Its own runner(s) |
+| Appears in the log as | One step | One or more jobs |
+| Can use `secrets` directly? | No (pass as input) | Yes (declared `secrets:` or `inherit`) |
+| Can define `runs-on`/`services`/`environment`/`permissions`? | No | Yes |
+| Share files with caller? | Yes (same workspace) | No (use artifacts) |
+| Nest depth | Actions can call actions | Limited |
+| Typical use | "Setup toolchain", "build and lint" | "Standard CI for every service", "deploy to env X" |
+
+Rule of thumb: if the shared thing is *a few steps inside a job*, make a composite action. If it is *a whole pipeline stage*, make a reusable workflow.
+
+### Lesson 8.4: JavaScript actions
+
+A JavaScript action runs a Node.js program directly on the runner. It starts faster than a container action and works on every runner OS. `action.yml`:
+
 ```yaml
-jobs:
-  call-local:
-    uses: ./.github/workflows/reusable.yml
-```
-
-**Behavior**: Uses workflow definition from the **current commit**.
-
-**Use case**: Development/testing, workflows that evolve together.
-
-**Option 2: Repository reference** (same or different repository):
-```yaml
-jobs:
-  call-versioned:
-    uses: organization/repo/.github/workflows/reusable.yml@v1.2.3
-```
-
-**Behavior**: Uses workflow definition from **specified commit/tag/branch**.
-
-**Use case**: Production, external shared workflows, version pinning.
-
-### When to Use Reusable Workflows
-
-**Good fit**:
-- Enforcing standardized deployment processes
-- Organization-wide CI/CD templates
-- Multi-environment workflows (staging, production)
-- Workflows that must execute in specific order with specific configuration
-
-**Not ideal**:
-- Simple step sequences (use composite actions)
-- Need to mix steps from reusable logic with custom steps
-- Workflows that differ significantly between uses
-
-## Composite Action vs. Reusable Workflow: Decision Framework
-
-Use this flowchart to decide:
-
-```
-Do you need to reuse logic across multiple repos/workflows?
-├─ NO → Use standard workflow (no abstraction needed)
-└─ YES → Do you need to enforce standardization across entire workflow?
-    ├─ YES → Use reusable workflow
-    │        (Entire job definition is controlled centrally)
-    └─ NO → Use composite action
-             (Flexible mix of shared steps and custom steps)
-```
-
-**Example scenarios**:
-
-**Reusable workflow**:
-- "All deployments must run these exact steps in this exact order"
-- "Every release workflow must include approval gates and rollback procedures"
-
-**Composite action**:
-- "Many workflows need to install Node.js and cache npm modules"
-- "Several workflows lint code, but with different subsequent steps"
-
-## JavaScript and TypeScript Actions: Native GitHub Integration
-
-**Definition**: Actions written in JavaScript or TypeScript that run directly on the Node.js runtime provided by GitHub runners.
-
-**Why use them**: 
-- GitHub's **most natively supported** action type
-- Official `@actions/core` npm package for GitHub integration
-- Most marketplace actions use this approach
-- Fast execution (no container build overhead)
-
-### Anatomy of a JavaScript Action
-
-**Required files**:
-- `action.yml` - Action metadata
-- `index.js` - Entrypoint JavaScript file (or compiled from TypeScript)
-- `package.json` - npm dependencies
-- `node_modules/` or bundled output
-
-**action.yml**:
-```yaml
-name: 'JavaScript Action'
-description: 'Example JS action'
-
+name: Greeter
+description: Prints a greeting
 inputs:
-  name:
-    description: 'Name to greet'
+  who-to-greet:
+    description: Who to greet
     required: true
-
 outputs:
-  greeting:
-    description: 'The greeting message'
-
+  time:
+    description: Time of greeting
 runs:
-  using: 'node20'  # Node.js runtime version
-  main: 'dist/index.js'  # Entrypoint file
+  using: node24          # check the docs for the Node versions the runner currently supports
+  main: dist/index.js
 ```
 
-**Key differences from composite action**:
-- `runs.using:` specifies Node.js version (`node20`, `node16`)
-- `runs.main:` points to JavaScript file
-- No `steps:` section
-
-### The @actions/core Package
-
-**Installation**:
-```bash
-npm install @actions/core
-```
-
-**Purpose**: Official GitHub package providing utilities for:
-- Reading inputs
-- Setting outputs
-- Logging messages
-- Creating annotations
-- Failing workflow
-- Accessing environment variables
-
-**Common methods**:
+`src/index.js` using the toolkit:
 
 ```javascript
 const core = require('@actions/core');
 
-// Read inputs
-const name = core.getInput('name', { required: true });
-
-// Set outputs
-core.setOutput('greeting', `Hello, ${name}!`);
-
-// Logging
-core.debug('Debug message');
-core.info('Info message');
-core.warning('Warning message');
-core.error('Error message');
-
-// Fail the action
-core.setFailed('Something went wrong!');
-
-// Annotations
-core.notice('This is a notice');
-core.error('Missing semicolon', {
-  file: 'app.js',
-  startLine: 42,
-  startColumn: 10
-});
-
-// Group logs
-const group = core.startGroup('Build output');
-// ... build logs
-core.endGroup();
-```
-
-### Building a TypeScript Action
-
-**Why TypeScript over JavaScript**:
-- Type safety reduces bugs
-- Better IDE support and autocomplete
-- Compile-time error checking
-- Industry standard for GitHub Actions
-
-**Required compilation**: Must transpile TypeScript → JavaScript before use.
-
-**GitHub provides templates**:
-- TypeScript action template: github.com/actions/typescript-action
-- JavaScript action template: github.com/actions/javascript-action
-
-### TypeScript Action Structure
-
-**File layout**:
-```
-action-name/
-├── action.yml
-├── src/
-│   ├── main.ts
-│   └── index.ts
-├── dist/
-│   ├── index.js          # Compiled output
-│   └── index.js.map
-├── package.json
-├── tsconfig.json
-├── rollup.config.js      # Bundler configuration
-└── node_modules/
-```
-
-**src/main.ts** (logic):
-```typescript
-import * as core from '@actions/core';
-
-export async function run(): Promise<void> {
-  try {
-    const name = core.getInput('name', { required: true });
-    
-    core.info(`Hello, ${name}!`);
-    
-    const greeting = `Hello, ${name}!`;
-    core.setOutput('greeting', greeting);
-    
-  } catch (error) {
-    core.setFailed((error as Error).message);
-  }
+try {
+  const who = core.getInput('who-to-greet', { required: true });
+  core.notice(`Hello, ${who}!`);
+  core.setOutput('time', new Date().toISOString());
+} catch (error) {
+  core.setFailed(error.message);
 }
 ```
 
-**src/index.ts** (entrypoint):
-```typescript
-import { run } from './main';
+Key points:
 
-run();
-```
+- The runner does **not** run `npm install` for you. Either commit the dependencies, or (more usual) **bundle** the code and dependencies into one file with a tool such as `@vercel/ncc` or esbuild and commit `dist/`.
+- `@actions/core` gives `getInput`, `setOutput`, `setFailed`, `setSecret`, logging helpers; `@actions/github` gives an authenticated Octokit client; `@actions/exec`, `@actions/cache` and others exist.
+- The supported Node runtime for actions changes over time (older ones such as `node16` and `node20` are retired or being retired). Check the metadata syntax docs for the current value when you author or update an action.
+- TypeScript is just a compile step before bundling; the committed `dist/` is what runs. Add a CI check that `dist/` is up to date.
 
-**Build process**:
-```bash
-# Install dependencies
-npm install
+Use a JavaScript action when you need real programming logic, GitHub API calls, performance, or cross-platform support.
 
-# Compile TypeScript + bundle dependencies
-npm run bundle
-```
+### Lesson 8.5: Container actions
 
-**package.json** scripts:
-```json
-{
-  "scripts": {
-    "build": "tsc",
-    "bundle": "rollup -c",
-    "package": "npm run build && npm run bundle"
-  }
-}
-```
-
-**Bundler (rollup)**: Combines TypeScript output and node_modules into single `dist/index.js` file.
-
-**Why bundle**: 
-- Single file to maintain in repo
-- No need to commit node_modules (large, messy)
-- Faster action startup (no dependency resolution)
-
-### Using a JavaScript Action
+A container action ships its own filesystem and any language. `action.yml`:
 
 ```yaml
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Call JavaScript action
-        id: js-action
-        uses: ./.github/actions/my-js-action
-        with:
-          name: 'GitHub Actions User'
-      
-      - name: Show output
-        run: echo "${{ steps.js-action.outputs.greeting }}"
-```
-
-**No special requirements**: Action code already bundled as JavaScript.
-
-### When to Use JavaScript Actions
-
-**Good fit**:
-- Complex logic requiring control flow, data structures
-- Need GitHub API integration (issues, PRs, releases)
-- Multiple external npm dependencies
-- Organization-standard tooling
-- Potential for publishing to marketplace
-
-**Not ideal**:
-- Simple shell commands (use composite actions)
-- Need language other than JavaScript/TypeScript
-- Heavy dependencies (container actions may be better)
-
-## Container Actions: Any Language, Dockerized
-
-**Definition**: Actions that run inside Docker containers, allowing you to use **any programming language**.
-
-**Use case**: When your team's expertise is in Python, Go, Rust, etc., and JavaScript would be awkward.
-
-### Anatomy of a Container Action
-
-**Required files**:
-- `action.yml` - Action metadata
-- `Dockerfile` - Container image definition
-- `entrypoint.py` (or other language) - Action logic
-
-**action.yml**:
-```yaml
-name: 'Python Container Action'
-description: 'Example container action'
-
+name: Python greeter
+description: Greets in Python
 inputs:
   who-to-greet:
-    description: 'Who to greet'
+    description: Who to greet
     required: true
-
-outputs:
-  random-number:
-    description: 'Random number'
-
 runs:
-  using: 'docker'
-  image: 'Dockerfile'  # Or 'docker://user/image:tag'
+  using: docker
+  image: Dockerfile            # built on each run; or  docker://ghcr.io/org/image:tag  (pre-built, faster)
 ```
 
-**Key field**: `runs.using: docker`
+`Dockerfile`:
 
-**Image options**:
-1. **`image: 'Dockerfile'`** - Build from Dockerfile in repository
-2. **`image: 'docker://owner/repo:tag'`** - Pull pre-built image from registry
-
-### Building a Python Container Action
-
-**Dockerfile**:
 ```dockerfile
-FROM python:3.11-slim
-
-# Copy action code
+FROM python:3.13-slim
 COPY entrypoint.py /entrypoint.py
-
-# Install dependencies (if needed)
-# COPY requirements.txt /requirements.txt
-# RUN pip install --no-cache-dir -r /requirements.txt
-
-# Make entrypoint executable
-RUN chmod +x /entrypoint.py
-
-# Set entrypoint
-ENTRYPOINT ["/entrypoint.py"]
+ENTRYPOINT ["python", "/entrypoint.py"]
 ```
 
-**entrypoint.py**:
-```python
-#!/usr/bin/env python3
-import os
-import sys
-import random
+`entrypoint.py`:
 
-# Read input from environment variable
-# GitHub formats as: INPUT_<NAME-IN-UPPERCASE>
-who_to_greet = os.environ.get('INPUT_WHO-TO-GREET', 'World')
-
-# Or read from sys.argv
-# who_to_greet = sys.argv[1] if len(sys.argv) > 1 else 'World'
-
-# Print notice message (workflow command)
-print(f'::notice::Hello, {who_to_greet}!')
-
-# Set output (write to GITHUB_OUTPUT file)
-random_number = random.randint(1, 10000)
-output_file = os.environ.get('GITHUB_OUTPUT')
-if output_file:
-    with open(output_file, 'a') as f:
-        f.write(f'random-number={random_number}\n')
-
-print(f'Generated random number: {random_number}')
-```
-
-### Accessing Inputs in Container Actions
-
-**Option 1: Environment variables** (recommended):
 ```python
 import os
 
-# Input name: who-to-greet
-# Environment variable: INPUT_WHO-TO-GREET
-value = os.environ.get('INPUT_WHO-TO-GREET')
+who = os.environ.get("INPUT_WHO-TO-GREET", "World")
+print(f"::notice::Hello, {who}!")
+with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+    out.write("time=now\n")
 ```
 
-**Pattern**: `INPUT_<NAME-IN-UPPERCASE-WITH-HYPHENS>`
+Input environment variable names are `INPUT_` + the input name **uppercased** (spaces become underscores; **hyphens are kept**). So `who-to-greet` becomes `INPUT_WHO-TO-GREET`, which shell code cannot read as `$INPUT_WHO-TO-GREET`; read it with `os.environ[...]` (Python), `env` (shell) or pass inputs as `args:` in `action.yml`.
 
-**Option 2: Command-line arguments**:
-```python
-import sys
+Trade-offs: Linux runners only; a `Dockerfile` image is built every run (slow), a pre-built `docker://` image is much faster; larger attack surface; full language freedom. Use it when you need a specific toolchain or language that isn't available on the runner.
 
-value = sys.argv[1]  # First argument
+### Lesson 8.6: Workflow commands (what actions use to talk to the runner)
+
+| Purpose | Mechanism |
+|---|---|
+| Notice / warning / error annotation | `echo "::notice file=app.js,line=1::message"` (`::warning`, `::error`) |
+| Group log lines | `::group::Title` … `::endgroup::` |
+| Mask a value in logs | `echo "::add-mask::value"` |
+| Debug message (shown with debug logging) | `echo "::debug::message"` |
+| Set a step output | append `name=value` to `$GITHUB_OUTPUT` |
+| Set an env var for later steps | append to `$GITHUB_ENV` |
+| Prepend to `PATH` | append the directory to `$GITHUB_PATH` |
+| Markdown on the run summary | append to `$GITHUB_STEP_SUMMARY` |
+
+The old `::set-output`, `::save-state` (in its original form), `::set-env` and `::add-path` commands are deprecated and the last two were disabled for security reasons; use the environment files above.
+
+### Lesson 8.7: Sharing and publishing
+
+| Where | How | Notes |
+|---|---|---|
+| Same repository | `uses: ./.github/actions/name` | Requires checkout first |
+| Public repository | `uses: owner/repo@v1` | Anyone can use it; tag releases, move a major tag (`v1`) deliberately, and document inputs |
+| Private repository, same org | Enable sharing in the repository's **Settings → Actions → General → Access** | Callers need access |
+| Marketplace | Add `name`, `description`, branding to `action.yml`, then publish a release with the "Publish to Marketplace" option | Optional; listing is not required to use an action |
+| Reusable workflows in a central repo | `uses: org/repo/.github/workflows/x.yml@tag` | Version them with tags |
+
+Version your action like a library. Publish `v1.2.3` tags, move the `v1` tag only for backward-compatible changes, and write release notes.
+
+## 3. Mental model
+
+- A **composite action** is a *macro*: it pastes steps into your job.
+- A **reusable workflow** is a *function that creates jobs*: it has parameters, its own machines, and a return value.
+- A **JavaScript action** is a *small program* the runner executes.
+- A **container action** is a *program shipped with its own operating system*.
+
+## 4. Decision table
+
+| Need | Choose |
+|---|---|
+| Share 3–10 steps; same runner and files | Composite action |
+| Share an entire CI or deploy pipeline; own runners/environments/matrix | Reusable workflow |
+| Complex logic or GitHub API work, runs on all OSes, fast start | JavaScript action |
+| Non-JS language or special system dependencies | Container action |
+| Logic you'd also like to run locally | A script or task runner in the repo (Chapter 10), called from any of the above |
+
+Often the best answer is none of them: write `scripts/thing.sh`, test it locally, and call it with `run:`. Create an action when you need reuse across repositories or a clean inputs/outputs contract.
+
+## 5. Practical example
+
+A reusable workflow that calls a composite action, called once per service via a matrix. Layout:
+
+```
+.github/
+  actions/setup-app/action.yml        # Lesson 8.1
+  workflows/
+    reusable-test.yml                 # Lesson 8.2, adding a `service` input
+    ci.yml                            # caller
 ```
 
-**action.yml configuration**:
+Caller:
+
 ```yaml
-runs:
-  using: 'docker'
-  image: 'Dockerfile'
-  args:
-    - ${{ inputs.who-to-greet }}
-```
-
-### Workflow Commands in Container Actions
-
-**Problem**: No official GitHub package for non-JavaScript languages.
-
-**Solution**: Use **workflow commands** - special strings printed to stdout that GitHub Actions recognizes.
-
-**Format**: `::command parameter1={value1},parameter2={value2}::{message}`
-
-**Common commands**:
-
-```python
-# Notice annotation
-print('::notice::This is a notice message')
-
-# Warning annotation
-print('::warning file=app.py,line=10::Missing type hint')
-
-# Error annotation
-print('::error file=app.py,line=15::Syntax error')
-
-# Set output (DEPRECATED - use GITHUB_OUTPUT file instead)
-# print(f'::set-output name=result::{value}')
-
-# Add to PATH
-print(f'::add-path::/usr/local/custom/bin')
-
-# Set environment variable
-print(f'::set-env name=API_KEY::secret-value')
-```
-
-**Setting outputs** (modern approach):
-```python
-import os
-
-output_file = os.environ['GITHUB_OUTPUT']
-with open(output_file, 'a') as f:
-    f.write(f'output-name={value}\n')
-```
-
-### Pre-built vs. Dockerfile Image
-
-**Option 1: Build from Dockerfile** (development):
-```yaml
-runs:
-  using: 'docker'
-  image: 'Dockerfile'
-```
-
-**Behavior**: Builds container image **every workflow run**.
-
-**Advantages**:
-- Always uses latest code
-- No separate build/publish step
-- Great for testing
-
-**Disadvantages**:
-- **Slow** (build time adds 30s-2min per run)
-- Wasted compute rebuilding unchanged images
-- Not suitable for production
-
-**Option 2: Pre-built image** (production):
-```yaml
-runs:
-  using: 'docker'
-  image: 'docker://ghcr.io/user/action:v1.2.3'
-```
-
-**Behavior**: Pulls existing image from registry.
-
-**Advantages**:
-- **Fast** (pull vs. build)
-- Production-ready
-- Versioned and immutable
-
-**Disadvantages**:
-- Requires separate build/push workflow
-- More complex release process
-
-**Build and push workflow**:
-```yaml
-name: Build Action Image
-
+name: CI
 on:
-  release:
-    types: [published]
-
+  pull_request:
+permissions:
+  contents: read
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-```
-
-### When to Use Container Actions
-
-**Good fit**:
-- Team expertise in non-JavaScript language
-- Existing codebase in Python, Go, Rust, etc.
-- Dependencies with better ecosystem in another language
-- Need specific system libraries or tools
-
-**Not ideal**:
-- Simple logic (overhead not worth it)
-- Speed-critical workflows (container startup adds latency)
-- Actions that run frequently (build overhead compounds)
-
-## Workflow Commands Reference
-
-**Definition**: Special strings that, when printed to stdout, control GitHub Actions behavior.
-
-**Format**: `::command parameter1=value1,parameter2=value2::message`
-
-### Complete Workflow Commands
-
-| Command | Purpose | Example |
-|---------|---------|---------|
-| `::debug::` | Debug message (only visible with debug logging enabled) | `::debug::Variable value: $VAR` |
-| `::notice::` | Notice annotation (info level) | `::notice::Build completed` |
-| `::warning::` | Warning annotation | `::warning file=app.js,line=10::Deprecated API` |
-| `::error::` | Error annotation (doesn't fail workflow) | `::error file=app.js,line=15::Syntax error` |
-| `::group::/::endgroup::` | Collapsible log group | `::group::Build logs` ... `::endgroup::` |
-| `::add-mask::` | Mask value in logs | `::add-mask::$SECRET_VALUE` |
-| `::stop-commands::` | Temporarily disable command processing | `::stop-commands::token` ... `::token::` |
-
-### Modern Output/Environment Setting
-
-**Setting outputs** (write to file):
-```bash
-echo "output-name=value" >> $GITHUB_OUTPUT
-```
-
-**Setting environment variables** (write to file):
-```bash
-echo "VAR_NAME=value" >> $GITHUB_ENV
-```
-
-**Adding to PATH** (write to file):
-```bash
-echo "/usr/local/custom/bin" >> $GITHUB_PATH
-```
-
-**Why file-based**: More secure, prevents log injection attacks.
-
-## Decision Framework: Choosing the Right Tool
-
-Here's a comprehensive flowchart for deciding which approach to use:
-
-```
-Was I able to find a reputable public action in the marketplace?
-├─ YES → Use marketplace action
-└─ NO → Is the logic simple (1-2 shell commands)?
-    ├─ YES → Inline shell script in workflow
-    └─ NO → Is bash sufficient, or do I need more expressivity?
-        ├─ BASH SUFFICIENT → External bash file (makefile, taskfile)
-        └─ NEED MORE → Do I need external dependencies?
-            ├─ NO → In-repo Python/Node script called from workflow
-            └─ YES → JavaScript/TypeScript action or Container action?
-                ├─ JAVASCRIPT → Use JavaScript/TypeScript action
-                │              (better GitHub integration)
-                └─ OTHER LANGUAGE → Use container action
-                                   (flexibility for any language)
-```
-
-### Practical Recommendations
-
-**Most workflows**: Combination of:
-1. Marketplace actions for common tasks
-2. Bash scripts in makefiles/taskfiles for custom logic
-3. Occasional composite actions for repeated step sequences
-
-**When to invest in full actions**:
-- Logic used across 10+ workflows
-- Organization-wide standardization needed
-- Complex interactions with GitHub API
-- Publishing to marketplace for community
-
-## Publishing Actions
-
-### Publishing to Marketplace
-
-**Requirements**:
-1. Public repository
-2. `action.yml` in repository root
-3. Valid action metadata (name, description, author)
-4. README.md with usage documentation
-
-**Process**:
-1. Create action in public repository
-2. Push `action.yml` to repository root
-3. Create GitHub release
-4. Check "Publish this action to GitHub Marketplace" in release UI
-5. Select category for action
-6. Publish release
-
-**Release interface**: When drafting release, GitHub detects `action.yml` and offers marketplace publication checkbox.
-
-**Marketplace listing**: Action appears at `github.com/marketplace/actions/<action-name>`
-
-### Using Private Actions
-
-**Same repository**:
-```yaml
-steps:
-  - uses: actions/checkout@v4  # Required!
-  - uses: ./.github/actions/my-action
-```
-
-**Different private repository** (same organization):
-
-**Step 1: Grant access** (in source repo):
-1. Settings → Actions → General
-2. Scroll to "Access"
-3. Select "Accessible from repositories in 'organization' organization"
-
-**Step 2: Reference in workflow**:
-```yaml
-steps:
-  - uses: organization/private-action-repo/.github/actions/my-action@main
-```
-
-**Important limitations**:
-- Source and consumer must **both be private**, OR
-- Source and consumer must **both be public**
-- **Cannot** use private action from public repo
-
-## Complete Example: All Action Types
-
-Here's a workflow demonstrating all action types:
-
-```yaml
-name: Action Types Demo
-
-on: workflow_dispatch
-
-jobs:
-  composite:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/composite-hello
-        with:
-          who-to-greet: 'Composite User'
-  
-  javascript:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/js-hello
-        with:
-          name: 'JS User'
-  
-  container-dockerfile:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/container-hello
-        with:
-          who-to-greet: 'Container User'
-  
-  container-prebuilt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: docker://ghcr.io/user/action:v1.0.0
-        with:
-          who-to-greet: 'Prebuilt Container User'
-
-  reusable:
-    uses: ./.github/workflows/reusable-deploy.yml
+  test:
+    strategy:
+      matrix:
+        service: [api, web]
+    uses: ./.github/workflows/reusable-test.yml
     with:
-      environment: staging
-    secrets:
-      deploy-key: ${{ secrets.STAGING_KEY }}
+      node-version: '22'
+      service: ${{ matrix.service }}
 ```
 
-## Key Takeaways
+In `reusable-test.yml`, add the input `service` (type `string`) and use it in a step with `working-directory: services/${{ inputs.service }}`. Pass any `inputs.*` through `env:` if used inside a `run:` script.
 
-**Composite actions**:
-- Easiest to create (just bundle steps in action.yml)
-- No build process required
-- Limited to step-level reuse
-- Best for 3-10 step sequences
+## 6. Execution walkthrough
 
-**Reusable workflows**:
-- Job-level reuse (entire workflow definitions)
-- Enforce standardization across organization
-- Support inputs and secrets (with inheritance)
-- Best for complete CI/CD templates
+1. A pull request fires `ci.yml`. The matrix creates two *calling* jobs (`test (api)`, `test (web)`).
+2. Each calling job starts the reusable workflow as its own set of jobs, each on a fresh runner, with the matrix value passed as `inputs.service`.
+3. In the called job, `actions/checkout` runs, then the local composite action is read from the workspace and its inner steps run inline on the same runner.
+4. The called workflow's job output flows up to the caller's `needs.test.outputs.*`. If any called job fails, the calling job fails.
 
-**JavaScript/TypeScript actions**:
-- GitHub's most natively supported type
-- Official @actions/core package for integration
-- Requires build/bundle step
-- Best for complex logic with npm dependencies
+## 7. Common mistakes
 
-**Container actions**:
-- Any language supported
-- Requires Docker knowledge
-- Slower startup (container build/pull)
-- Best when team expertise is in non-JS language
+| Mistake | Effect | Fix |
+|---|---|---|
+| Composite `run:` without `shell:` | Error: required | Add `shell: bash` |
+| Using `secrets.X` inside a composite action | Not available | Pass as an input |
+| Calling a local composite action before `checkout` | Action not found | Checkout first |
+| Giving the calling job both `uses:` and `steps:` | Invalid | One or the other |
+| Expecting files from a reusable workflow to appear in the caller | Separate runners | Upload/download artifacts |
+| `secrets: inherit` across trust boundaries | Over-sharing | Pass secrets explicitly |
+| Assuming a caller's environment secrets reach the called workflow | Empty values | Declare `environment:` in the called job and test |
+| JS action without committed `dist/` | "Cannot find module" | Bundle and commit it |
+| Reading `$INPUT_WHO-TO-GREET` in bash | Invalid variable name | Use `env`/`printenv` or `args:` |
+| Using `::set-output`, `::set-env`, `::add-path` | Deprecated or disabled | Use the environment files |
+| Tagging a breaking change as `v1` | Breaks every consumer | Bump the major version |
 
-**Decision factors**:
-1. Can I find a marketplace action? (use that first)
-2. Is it simple? (inline bash)
-3. Need to reuse? (composite action or reusable workflow)
-4. Need dependencies? (JavaScript or container action)
-5. JavaScript viable? (prefer JS action over container)
+## 8. Security considerations
 
-**Publishing**:
-- Public actions: Marketplace via GitHub release UI
-- Private actions: Grant access in repository settings
-- Always pin to commit SHA when consuming actions
+- Reusable workflows and shared actions are a **centralized attack surface**: whoever can push to the shared repository can change every caller's pipeline. Protect its branches and pin callers to tags or SHAs.
+- Callers should limit `permissions:` and pass only needed secrets.
+- Treat inputs as untrusted text; never interpolate `${{ inputs.* }}` directly into a script (Chapter 5).
+- Container actions run as root by default and with the workspace mounted; keep images minimal and pin base images by digest where practical.
+- A published JavaScript action's `dist/` file is what runs; verify it matches the source (CI check).
 
-## Next Chapter
+## 9. Hands-on exercise
 
-You've learned how to build custom actions for any need. In Chapter 9, we'll explore **Common Workflows**—real-world CI/CD patterns you'll encounter in production. You'll see how to combine marketplace actions, custom actions, and GitHub's features to build complete automation systems for testing, building, deploying, and maintaining applications. These battle-tested patterns form the foundation of modern software delivery.
+**Goal:** build and call a composite action and a reusable workflow.
+
+1. On a branch in your practice repository create `.github/actions/hello/action.yml`, a composite action with input `name` (default `world`) and output `greeting`. Its steps: print a greeting using `env:` for the input, and write `greeting=Hello, <name>` to `$GITHUB_OUTPUT`.
+2. Create `.github/workflows/reusable-hello.yml` (`workflow_call`) with an input `name` that checks out the repository, calls your composite action, and exposes the greeting as a workflow output.
+3. Create `.github/workflows/hello-caller.yml` with `workflow_dispatch` and two calling jobs: one with `name: Ada`, one with a matrix over `[Ada, Linus]`. Add a third job that `needs:` the first and prints its output.
+4. Run `actionlint`, push, merge to the default branch, trigger via `gh workflow run hello-caller.yml`.
+5. Experiment: remove `shell: bash` and observe the error; add `secrets.X` inside the composite action and observe the context error; change `uses:` to include both `uses` and `steps` and read the validation message.
+
+**Success looks like:** three called workflows visible in the run graph, with the output printed by the dependent job.
+
+**If it fails:** "can't find action.yml" → missing checkout or wrong path; "workflow is not reusable" → no `workflow_call` trigger; "invalid input" → `with:` name differs from the declared input.
+
+## 10. Verification checklist
+
+- [ ] `actionlint` is clean.
+- [ ] The composite action has `shell:` on all run steps and no `secrets` reference.
+- [ ] The reusable workflow declares typed inputs and outputs.
+- [ ] The caller sets `permissions:` and passes secrets explicitly (if any).
+- [ ] You can state why you chose a composite action vs. a reusable workflow for each piece.
+
+## 11. Knowledge check
+
+1. What can a reusable workflow do that a composite action cannot?
+2. Which runs on the caller's runner and workspace?
+3. How does a composite action receive a secret?
+4. Why must a JavaScript action's dependencies be bundled?
+5. What is `INPUT_WHO-TO-GREET`, and why can't bash read it directly as a variable?
+6. Why prefer `echo "x=y" >> "$GITHUB_OUTPUT"` over `::set-output`?
+7. When is a script in the repository a better choice than any of the four?
+
+<details>
+<summary>Answers</summary>
+
+1. Define jobs: its own runner, matrix, services, environments, permissions, and directly use secrets.
+2. A composite action.
+3. As an input passed by the caller (`with: token: ${{ secrets.TOKEN }}`).
+4. The runner does not run `npm install` for actions.
+5. The environment variable for input `who-to-greet`; hyphens make it an invalid shell identifier, so use `env`/`printenv`, a language runtime, or `args:`.
+6. The old command is deprecated; the file-based approach is supported.
+7. When the logic is used in one repository and should be runnable locally.
+</details>
+
+## 12. Key takeaways
+
+- Composite = reuse steps; reusable workflow = reuse jobs; JavaScript = programmable and fast; container = any language.
+- Don't create an action until a script isn't enough.
+- Secrets, permissions and environments are handled differently in each; test them.
+- Central shared logic needs central protection and versioning.
+
+## Sources and further reading
+
+- Original notes: `git show master:08_authoring_actions.md`. Corrections: environment-secret inheritance claim reworded and flagged for verification; removed `::add-path::`/`::set-env::`; clarified the `INPUT_` naming (hyphens retained, as the later chapters also assume); updated the JS runtime guidance; trimmed the duplicate decision flowchart that Chapter 11 also repeated.
+- Official docs: [Reusable workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/reusable-workflows) · [Workflow commands](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands) · [Workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax) · [Contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts)
+- Not verified here: exact limits on reusable-workflow nesting depth and the Node runtimes currently accepted in `runs.using`; check the docs when you build.

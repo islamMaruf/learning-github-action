@@ -1,900 +1,402 @@
-# Chapter 9: Common Workflows - Real-World CI/CD Patterns
+# Chapter 9: Common Workflow Patterns: Lint, Test, Build, Deploy, Maintain
 
-## Overview
+> **Level:** intermediate · **Time:** 3 hours · **Prerequisites:** [Chapters 5–8](05_core_features.md)
+> **Next:** [Chapter 10: Developer Experience](10_developer_experience.md)
 
-Now that you understand the features and capabilities GitHub Actions provides, it's time to see how they combine into real-world workflows. This chapter walks through **common workflow patterns** you'll encounter when automating software delivery.
+## Learning objectives
 
-We'll explore:
-- **Linting** - Enforcing code quality standards
-- **Testing** - Running automated test suites
-- **Static analysis** - Security scanning and code analysis
-- **Building** - Compiling applications and container images
-- **Deploying** - Push-based and GitOps deployment strategies
-- **Repository automation** - Releases, stale issue management, dependency updates
+After this chapter you can:
 
-For each pattern, we'll start with a **naive baseline** implementation, then explore **optimizations** using marketplace actions and advanced features.
+- Design a workflow by starting from the local command, then wrapping it.
+- Write lint, test, static-analysis, build and release workflows with sensible triggers and permissions.
+- Explain the difference between push-based and GitOps deployment workflows and write the safe version of each.
+- Automate repository chores: releases, stale issues, dependency updates.
+- Use GitHub's starter workflow templates without copying them blindly.
 
-## Approaching Workflow Design
+## 1. Problem statement
 
-**Starting principle**: Break down your task into individual steps.
+Chapters 5–8 taught features. Real work needs patterns: *what does a good lint workflow look like? how should deploys be triggered? what automation is worth having?* This chapter is a catalogue of the patterns you will write most, each with the mistakes that usually come with them.
 
-**Process**:
-1. **Identify the goal** - What needs to happen?
-2. **List the steps** - What individual actions achieve this?
-3. **Implement baseline** - Get it working first
-4. **Optimize** - Improve performance, user experience, maintainability
+## 2. Core explanation
 
-**Philosophy**: Start simple, iterate toward excellence.
+### Lesson 9.1: How to design a workflow
 
-## Linting: Enforcing Code Quality
+1. **Make it work on your machine first.** Write the exact commands (`npm run lint`, `go test ./...`). A workflow that wraps commands you already trust is easy to debug.
+2. **Wrap, don't invent.** Add `runs-on`, checkout, language setup, then the commands.
+3. **Choose the trigger by the question you're answering:** "Is this change OK?" → `pull_request`. "What's now on main?" → `push` to `main`. "Ship it" → tag, release or manual dispatch with approvals.
+4. **Add the safety defaults** from Chapters 5–6: `permissions: contents: read`, `timeout-minutes`, `concurrency`.
+5. **Then optimize**: caching, path filters, matrix.
 
-### Naive Implementation
+### Lesson 9.2: Linting
 
-**Goal**: Run linters to catch code quality issues.
-
-**Basic approach**:
 ```yaml
-name: Lint Code
-
-on: [push, pull_request]
-
+name: Lint
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Install linter
-        run: npm install -g eslint
-      
-      - name: Run linter
-        run: eslint .
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
 ```
 
-**What this does**:
-- Checks out repository code
-- Installs ESLint globally
-- Runs linter on all files
+The "optimized" version versus a naive one is exactly: caching (via `cache: npm`), cancelling superseded runs, and narrow permissions. For multi-language repositories, an aggregator such as `super-linter/super-linter` (a maintained community project) runs many linters in one action; read its README for the current version and configuration. Keep linters in the repository's own config so developers run the same checks locally.
 
-**Problems**:
-- Lints **all files** every time (slow on large codebases)
-- No reporting of results in GitHub UI
-- Doesn't cache dependencies
-- Only supports one language
+### Lesson 9.3: Testing
 
-### Optimized Implementation
+Testing workflows add three things beyond lint:
 
-**Improvements we want**:
-1. **Detect changed files** - Only lint what changed
-2. **Report status** - Show results as PR checks/annotations
-3. **Multi-language support** - Lint Python, JavaScript, Go, etc.
-4. **Efficient execution** - Cache dependencies, parallel execution
+- **A matrix** over supported runtimes/OSes (Chapter 6).
+- **Services** such as a database: 
 
-**Solution**: Use **Super-Linter** action from marketplace.
+  ```yaml
+  services:
+    postgres:
+      image: postgres:16
+      env:
+        POSTGRES_PASSWORD: postgres     # throwaway CI-only value
+      ports: ['5432:5432']
+      options: >-
+        --health-cmd "pg_isready -U postgres"
+        --health-interval 5s --health-retries 10
+  ```
+  The `options` health check makes the job wait until the database is ready.
+- **Test reports and coverage** uploaded with `if: always()` so you can inspect failures.
 
 ```yaml
-name: Lint Code (Optimized)
+- run: npm test -- --coverage
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: coverage-${{ matrix.node }}
+    path: coverage/
+```
 
-on: [push, pull_request]
+If a test takes long, run it in a separate job so the quick checks report first.
+
+### Lesson 9.4: Static analysis and security scanning
+
+Typical building blocks: **CodeQL** (GitHub's code scanning; needs `security-events: write`), **dependency review** on pull requests, container image scanners (for example Trivy), and secret scanning (a repository setting rather than a workflow). Pattern:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write       # to upload SARIF results to the Security tab
+```
+
+Run scans on pull requests (to block) and on a schedule (to catch newly disclosed vulnerabilities in unchanged code). Pin and review third-party scanners like any other action (Chapter 7). Check each tool's README for its current action name and version; do not copy `uses:` lines from older notes.
+
+### Lesson 9.5: Building
+
+Two common build outputs:
+
+**Executables / bundles** → upload with `upload-artifact` or attach to a release. For multiple OS/architectures use a matrix and name each artifact with the matrix value.
+
+**Container images** → covered end-to-end in Chapter 13 (Buildx, QEMU, metadata, push to a registry). The essentials:
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+steps:
+  - uses: actions/checkout@v5
+  - uses: docker/login-action@v3
+    with:
+      registry: ghcr.io
+      username: ${{ github.actor }}
+      password: ${{ secrets.GITHUB_TOKEN }}
+  - uses: docker/build-push-action@v6
+    with:
+      context: .
+      push: ${{ github.event_name != 'pull_request' }}   # build on PRs, push only on main/tags
+      tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+```
+
+Tag images with something immutable (commit SHA or version), not just `latest`.
+
+### Lesson 9.6: Deploying
+
+| | Push-based | GitOps |
+|---|---|---|
+| Workflow does | Authenticate to the target and apply the change | Commit a new image tag to a manifest repository; an in-cluster agent syncs |
+| Credentials in GitHub | Cloud/cluster credentials (prefer OIDC) | Write access to the manifests repo only |
+| Rollback | Re-run an earlier deploy | `git revert` |
+
+**Push-based, safely.** Key rules: use an `environment:` with required reviewers for production; serialize with `concurrency`; get credentials by OIDC; **never interpolate secrets or user text into the shell script**.
+
+```yaml
+name: Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          fetch-depth: 0  # Fetch full history for diff analysis
-      
-      - name: Run Super-Linter
-        uses: github/super-linter@v5
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}     # non-secret config in vars
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VALIDATE_ALL_CODEBASE: false  # Only lint changed files
+          TARGET: ${{ inputs.environment }}
+        run: ./scripts/deploy.sh "$TARGET"
 ```
 
-**What Super-Linter provides**:
-- **40+ language support** - JavaScript, TypeScript, Python, Go, Ruby, Shell, Docker, YAML, Markdown, etc.
-- **Changed file detection** - Only runs on modified files (requires `fetch-depth: 0`)
-- **GitHub integration** - Annotations appear on PR diffs
-- **Configured by default** - Sensible defaults, customizable via `.github/linters/` config files
+A frequent anti-pattern is writing a kubeconfig or key into a shell script via `${{ secrets.KUBECONFIG }}` inside `run:`. The secret is expanded into the script text and can leak through `set -x` output, and it makes injection mistakes easier. Pass it via `env:` or write it to a file from an `env:` variable, with `umask 077`, and delete it afterwards.
 
-**Key configuration**:
-- `fetch-depth: 0` - Downloads full git history (needed to calculate diffs)
-- `GITHUB_TOKEN` - Enables status check integration
-- `VALIDATE_ALL_CODEBASE: false` - Optimizes by only validating changes
+**GitOps, safely.** The workflow updates a version field in a manifest repository and pushes (Chapter 14 builds this fully). A bot should use a dedicated, narrowly scoped credential (a GitHub App token or deploy key), not a personal access token.
 
-**Result**: Four lines of code replace a multi-step custom solution while gaining performance, multi-language support, and better UX.
+### Lesson 9.7: Repository automation
 
-## Testing: Running Automated Test Suites
+**Releases.** Options in increasing sophistication:
 
-### Naive Implementation
+1. Manual: `gh release create v1.2.3 --generate-notes dist/*` in a job triggered by a tag (`on: push: tags: ['v*']`, `permissions: contents: write`).
+2. `softprops/action-gh-release` for richer asset handling.
+3. **Release PR tools** such as `googleapis/release-please-action`: it reads conventional commit messages, maintains a "release PR" with the changelog and next version, and creates the release when you merge it. Check its README for the current major version and for the token it needs.
 
-**Goal**: Run unit/integration tests on every push.
+The old `actions/create-release` and `actions/upload-release-asset` actions are archived and should not be used in new workflows; use the GitHub CLI or an actively maintained action.
 
-**Basic approach**:
 ```yaml
-name: Test
-
-on: [push, pull_request]
-
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
 jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --generate-notes
+```
+
+**Stale issues.** `actions/stale` on a schedule:
+
+```yaml
+name: Stale
+on:
+  schedule:
+    - cron: '17 3 * * *'     # daily, off the top of the hour
+permissions:
+  issues: write
+  pull-requests: write
+jobs:
+  stale:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/stale@v9
+        with:
+          days-before-stale: 60
+          days-before-close: 14
+          stale-issue-message: This issue has had no activity for 60 days. It will close in 14 days unless there is new activity.
+          exempt-issue-labels: pinned,security
+```
+
+Be cautious: auto-closing real bug reports annoys users. Exempt important labels and pick generous timeouts.
+
+**Dependency updates.** Use **Dependabot** (`.github/dependabot.yml`) or Renovate to open PRs for npm/pip/Go/Docker/GitHub Actions updates. Your normal CI runs on these PRs; the bot does not itself close PRs when tests fail, and it does not merge them unless you set up auto-merge deliberately. Dependabot PRs run with a read-only token and without regular repository secrets, so tests must not require them.
+
+Keep auto-merge limited to low-risk updates (for example patch updates with passing required checks) and require status checks via branch protection.
+
+### Lesson 9.8: GitHub's starter workflows
+
+In the **Actions** tab, **New workflow** shows templates (for Node, Docker, deployments to clouds, CodeQL, and more). They are good starting points because they encode the vendor's recommended steps. Before committing one: update the action versions, add `permissions`, narrow triggers, remove sample steps you don't need, and read every line. They are examples, not audited production pipelines.
+
+### Lesson 9.9: Design principles
+
+| Principle | Meaning |
+|---|---|
+| Fast feedback | Run cheap checks first; cancel superseded runs; cache |
+| Fail clearly | Name steps; keep logs readable; upload reports |
+| Least privilege | `permissions`, scoped secrets, OIDC |
+| Idempotent and re-runnable | A re-run should be safe |
+| Same commands everywhere | Developers can run the exact command locally |
+| Thin YAML | Logic in scripts (Chapter 10) |
+| Right trigger | Don't deploy on `pull_request` from forks |
+
+## 3. Mental model
+
+A good pipeline is a **funnel**: cheap, fast checks at the top catch most problems; expensive, risky steps (deploys) are at the bottom and are protected by approvals. Every item below the neck assumes the top checks passed (`needs:`).
+
+## 4. Syntax breakdown
+
+| Pattern | Key syntax |
+|---|---|
+| Don't push images from PRs | `push: ${{ github.event_name != 'pull_request' }}` |
+| Run on tags | `on: push: tags: ['v*']` |
+| Daily cron | `schedule: - cron: 'M H * * *'` (UTC) |
+| Gate production | `environment: production` (required reviewers in Settings) |
+| One deploy at a time | `concurrency: group: deploy-…, cancel-in-progress: false` |
+| Keep reports on failure | `if: always()` on upload steps |
+| Push tags/releases | `permissions: contents: write` |
+
+## 5. Practical example
+
+A combined `ci.yml` using the funnel: lint and test in parallel, then build only if both pass, and only push the image from `main`.
+
+```yaml
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci && npm run lint
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Install Node.js
-        run: |
-          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-          sudo apt-get install -y nodejs
-      
-      - name: Install dependencies
-        run: npm install
-      
-      - name: Build application
-        run: npm run build
-      
-      - name: Run tests
-        run: npm test
-```
-
-**Problems**:
-- No dependency caching (re-downloads on every run)
-- Test results not preserved
-- Manual Node.js installation (fragile)
-- No test result reporting
-
-### Optimized Implementation
-
-**Improvements**:
-1. **Use official setup actions** - Reliable, maintained installers
-2. **Enable caching** - Restore dependencies from cache
-3. **Upload artifacts** - Preserve test results
-4. **Report status** - Integrate test results with PR UI
-
-```yaml
-name: Test (Optimized)
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'  # Automatically caches node_modules
-      
-      - name: Install dependencies
-        run: npm ci  # Faster, more reliable than npm install
-      
-      - name: Build application
-        run: npm run build
-      
-      - name: Run tests
-        run: npm test -- --coverage
-      
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: coverage/
-```
-
-**Key improvements**:
-- **`actions/setup-node@v4`** - Official Node.js installer with built-in caching
-- **`cache: 'npm'`** - Automatically caches `node_modules` based on `package-lock.json` hash
-- **`npm ci`** - Clean install (faster, more reproducible than `npm install`)
-- **`if: always()`** - Uploads results even if tests fail
-- **Artifacts** - Test coverage reports available for download in workflow UI
-
-**Official setup actions** (use these instead of manual installation):
-- `actions/setup-node` - Node.js with npm/yarn caching
-- `actions/setup-python` - Python with pip caching
-- `actions/setup-java` - Java/JVM with Maven/Gradle caching
-- `actions/setup-go` - Go with module caching
-
-## Static Analysis: Security and Code Quality
-
-### Implementation Pattern
-
-**Goal**: Scan code for security vulnerabilities, code smells, technical debt.
-
-**Common tools**:
-- **CodeQL** - GitHub's semantic code analysis (finds security issues)
-- **Snyk** - Dependency vulnerability scanning
-- **SonarQube** - Code quality metrics
-- **Trivy** - Container image vulnerability scanning
-
-**Baseline approach**:
-```yaml
-name: Static Analysis
-
-on: [push, pull_request]
-
-jobs:
-  analyze:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Install analysis tool
-        run: |
-          # Install tool (e.g., Bandit for Python security)
-          pip install bandit
-      
-      - name: Run analysis
-        run: bandit -r . -f json -o report.json
-      
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: analysis-report
-          path: report.json
-```
-
-**Pattern**:
-1. Checkout code
-2. Install analysis tool
-3. Run scan
-4. Upload/report results
-
-**Optimization opportunities** (left as exercise):
-- Use marketplace action for tool (easier, cached)
-- Only scan changed files
-- Integrate results as PR comments/annotations
-- Fail workflow on critical findings
-
-## Building: Compiling Applications
-
-### Building Executables
-
-**Goal**: Compile source code into deployable artifacts.
-
-**Pattern**:
-```yaml
-name: Build Application
-
-on: [push]
-
-jobs:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci && npm test
   build:
-    runs-on: ubuntu-latest
+    needs: [lint, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Setup language toolchain
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Build application
-        run: npm run build
-      
-      - name: Publish to registry
-        run: |
-          npm config set //registry.npmjs.org/:_authToken ${{ secrets.NPM_TOKEN }}
-          npm publish
-```
-
-**Steps**:
-1. Checkout code
-2. Setup language toolchain (Node.js, Go, Rust, etc.)
-3. Install dependencies
-4. Build application
-5. Publish to registry (npm, PyPI, Maven Central, etc.)
-
-### Building Container Images
-
-**Goal**: Build Docker image and push to registry.
-
-**Pattern**:
-```yaml
-name: Build Container Image
-
-on: [push]
-
-jobs:
-  build-image:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
 ```
 
-**Key components**:
-- **Docker Buildx** - Advanced build features (multi-platform, caching)
-- **Login action** - Authenticates to registry
-- **Build-push action** - Builds and pushes in one step
-- **Layer caching** - Dramatically speeds up builds by reusing layers
+## 6. Execution walkthrough
 
-**Registries supported**:
-- **GitHub Container Registry** (ghcr.io) - Free for public repos
-- **Docker Hub** - Most popular
-- **AWS ECR** - Elastic Container Registry
-- **Azure ACR** - Azure Container Registry
-- **Google Artifact Registry** - GCP registry
+On a pull request: `lint` and `test` start in parallel on separate runners. If both succeed, `build` starts, builds the image, skips login and does **not** push. On a merge to `main`: the same three jobs run; `build` logs in to GHCR with the temporary token and pushes `ghcr.io/<owner>/<repo>:<sha>`. A second push to the same branch while the first run is going cancels the first run.
 
-## Deploying: Getting Code to Production
+## 7. Common mistakes
 
-### Push-Based Deployment
+| Mistake | Fix |
+|---|---|
+| Triggering lint on both `push` and `pull_request` for all branches (double runs) | Limit `push` to `main` |
+| `${{ secrets.KUBECONFIG }}` pasted into a `run:` script | Use `env:` and a protected temp file |
+| Using archived `actions/create-release` | `gh release create` or a maintained action |
+| Believing Dependabot closes failing PRs | It does not; failing checks block merge only if branch protection requires them |
+| `actions/stale` with short timeouts and no exemptions | Generous timers, exempt labels |
+| Deploying from `pull_request` | Deploy from protected branches, tags or manual dispatch |
+| Pushing `latest` only | Immutable tags (SHA or version) |
+| Copying starter workflows unchanged | Update versions, add `permissions` |
 
-**Definition**: Workflow authenticates to target environment and pushes code directly.
+## 8. Security considerations
 
-**Use case**: Traditional deployments where GitHub Actions has credentials for production.
+- Deploy workflows are the highest-value target: restrict who can trigger them, use environments with reviewers, OIDC, minimal roles, and `concurrency` serialization.
+- Scheduled and maintenance workflows with `write` permissions are risky if the action is compromised; pin them.
+- Do not run untrusted PR code with secrets (Chapter 11).
+- A release workflow with `contents: write` can modify tags and releases; limit to tag pushes from trusted maintainers.
 
-**Pattern**:
-```yaml
-name: Deploy to Production
+## 9. Hands-on exercise
 
-on:
-  workflow_run:
-    workflows: ["Build Container Image"]
-    types: [completed]
-    branches: [main]
+**Goal:** build the CI funnel and one maintenance workflow in your practice repository.
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    environment: production  # Requires approval
-    steps:
-      - name: Checkout deployment configs
-        uses: actions/checkout@v4
-      
-      - name: Configure kubectl
-        run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
-      
-      - name: Deploy to Kubernetes
-        run: |
-          kubectl set image deployment/my-app \
-            app=ghcr.io/${{ github.repository }}:${{ github.sha }}
-          kubectl rollout status deployment/my-app
-      
-      - name: Validate deployment
-        run: |
-          # Wait for pods to be ready
-          kubectl wait --for=condition=ready pod -l app=my-app --timeout=300s
-          # Run smoke tests
-          curl -f https://my-app.production.example.com/health
-```
+1. Use a small Node project (`npm init -y`, add `"lint"` and `"test"` scripts that just run `echo`). Add a trivial `Dockerfile` (`FROM alpine:3.20`).
+2. Add the combined `ci.yml` above on a branch; `actionlint`; open a PR. Confirm the image is built but not pushed.
+3. Merge. Confirm a package appears under the repository's **Packages**.
+4. Add `.github/dependabot.yml` for `github-actions` and `npm`.
+5. Add the release workflow; create a tag in the practice repo (`git tag v0.0.1 && git push origin v0.0.1`) and confirm a release is created.
+6. Add the stale workflow with `workflow_dispatch` temporarily and trigger it. Remove the manual trigger after verifying behavior with a throwaway issue.
 
-**Components**:
-1. **Checkout configs** - Get deployment manifests/scripts
-2. **Install tooling** - kubectl, helm, AWS CLI, etc.
-3. **Authenticate** - Use OIDC or static credentials
-4. **Deploy** - Apply changes to environment
-5. **Validate** - Health checks, smoke tests
+**Success looks like:** green CI, an image in GHCR with the SHA tag, a release for `v0.0.1`.
 
-**Authentication options**:
+**If it fails:** `denied: permission_denied` pushing to GHCR → missing `packages: write`; release job 403 → missing `contents: write`.
 
-**OIDC (recommended)**:
-```yaml
-- name: Configure AWS credentials
-  uses: aws-actions/configure-aws-credentials@v4
-  with:
-    role-to-assume: arn:aws:iam::123456789012:role/GithubActionsRole
-    aws-region: us-east-1
-```
+## 10. Verification checklist
 
-**Static credentials** (less secure):
-```yaml
-- name: Configure AWS credentials
-  uses: aws-actions/configure-aws-credentials@v4
-  with:
-    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-    aws-region: us-east-1
-```
+- [ ] Each workflow has `permissions`, `timeout-minutes` and sensible `concurrency`.
+- [ ] PRs build but don't push.
+- [ ] Release uses `gh`/a maintained action, not `create-release`.
+- [ ] No secret is interpolated into a script body.
+- [ ] Dependabot PRs appear and run CI.
 
-### GitOps Deployment
+## 11. Knowledge check
 
-**Definition**: Workflow updates git repository; agent in cluster pulls changes.
+1. Why design a workflow starting from the local command?
+2. How do you build an image on PRs without pushing it?
+3. Why is `${{ secrets.KUBECONFIG }}` inside `run:` a bad idea?
+4. What happens to a Dependabot PR whose tests fail?
+5. Which permission does a job need to push an image to GHCR? To create a release?
+6. When is GitOps preferable to push-based deployment?
 
-**Use case**: Modern cloud-native deployments (Argo CD, Flux, Weaveworks).
+<details>
+<summary>Answers</summary>
 
-**Advantages**:
-- **No cluster credentials in GitHub** - More secure
-- **Git as single source of truth** - Audit trail, rollback via git
-- **Declarative** - Describe desired state, agent reconciles
-- **Separation of concerns** - CI builds, CD deploys
+1. So it's debuggable locally and the workflow is just a wrapper.
+2. `push: ${{ github.event_name != 'pull_request' }}`.
+3. The secret is expanded into script text (leak risk, injection pattern); pass it via `env:`.
+4. Nothing automatic: the check shows failed; it blocks merge only if required.
+5. `packages: write`; `contents: write`.
+6. Many services/clusters, desire to keep production credentials inside the cluster, auditability via Git.
+</details>
 
-**Pattern**:
-```yaml
-name: Update Deployment Manifest
+## 12. Key takeaways
 
-on:
-  workflow_run:
-    workflows: ["Build Container Image"]
-    types: [completed]
-    branches: [main]
+- Wrap local commands; layer on caching, matrix and concurrency.
+- Build on PRs, publish on `main`/tags.
+- Deploy through protected paths: environments, OIDC, serialized runs.
+- Automate chores, but conservatively.
+- Starter workflows are starting points.
 
-jobs:
-  update-manifest:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout deployment repo
-        uses: actions/checkout@v4
-        with:
-          repository: my-org/k8s-manifests
-          token: ${{ secrets.MANIFEST_REPO_TOKEN }}
-      
-      - name: Update image tag
-        run: |
-          # Update Kubernetes manifest with new image
-          sed -i "s|image: ghcr.io/.*|image: ghcr.io/${{ github.repository }}:${{ github.sha }}|" \
-            manifests/production/deployment.yaml
-      
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add manifests/production/deployment.yaml
-          git commit -m "Update production image to ${{ github.sha }}"
-          git push
-```
+## Sources and further reading
 
-**Flow**:
-1. **Build workflow** completes successfully
-2. **GitOps workflow** triggers
-3. Updates manifest in deployment repository
-4. Commits and pushes change
-5. **GitOps agent** (Argo CD/Flux) detects change
-6. Agent applies updates to cluster
-7. Application deploys automatically
-
-**Why this works**:
-- GitHub Actions only needs access to git repositories
-- No production credentials stored in GitHub
-- Deployment history preserved in git
-- Easy rollback (revert commit)
-
-## Repository Automation: Release Management
-
-### Automated Releases
-
-**Goal**: Automatically create versioned releases based on commit history.
-
-**Workflow**:
-1. Determine what changed since last release
-2. Calculate version bump (major, minor, patch)
-3. Update version references in codebase
-4. Generate changelog
-5. Commit changes
-6. Create GitHub release
-
-**Implementation strategy**:
-
-**Conventional Commits**:
-```
-feat: add user authentication (minor version bump)
-fix: resolve memory leak (patch version bump)
-feat!: redesign API (major version bump - breaking change)
-chore: update dependencies (no version bump)
-```
-
-**Pattern**: Prefix commits with type to indicate semantic version change.
-
-**Baseline implementation**:
-```yaml
-name: Release
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Need full history
-      
-      - name: Determine new version
-        id: version
-        run: |
-          # Parse commits since last tag
-          # Extract conventional commit types (feat, fix, etc.)
-          # Calculate semver bump
-          echo "new_version=v1.2.3" >> $GITHUB_OUTPUT
-      
-      - name: Update package.json
-        run: |
-          npm version ${{ steps.version.outputs.new_version }} --no-git-tag-version
-      
-      - name: Generate changelog
-        run: |
-          # Parse commits and generate CHANGELOG.md
-          echo "## ${{ steps.version.outputs.new_version }}" >> CHANGELOG.md
-      
-      - name: Commit changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json CHANGELOG.md
-          git commit -m "chore: release ${{ steps.version.outputs.new_version }}"
-          git push
-      
-      - name: Create GitHub release
-        uses: actions/create-release@v1
-        with:
-          tag_name: ${{ steps.version.outputs.new_version }}
-          release_name: Release ${{ steps.version.outputs.new_version }}
-```
-
-**Marketplace solution**: **Release Please** (by Google)
-
-```yaml
-name: Release
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: google-github-actions/release-please-action@v3
-        with:
-          release-type: node
-          package-name: my-package
-```
-
-**What Release Please does**:
-- Parses conventional commits
-- Creates "release PR" with version bumps and changelog
-- When PR merged, creates GitHub release automatically
-- Handles multiple packages in monorepos
-
-## Repository Automation: Stale Issues
-
-**Goal**: Automatically mark and close stale issues/PRs.
-
-**Why**: Keeps issue tracker tidy, encourages activity.
-
-**Baseline implementation**:
-```yaml
-name: Close Stale Issues
-
-on:
-  schedule:
-    - cron: '0 0 * * *'  # Daily at midnight
-
-jobs:
-  stale:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch issues
-        run: |
-          # Use GitHub API to list all issues
-          # Filter for issues inactive > 30 days
-      
-      - name: Mark as stale
-        run: |
-          # Add "stale" label
-          # Post comment warning of closure
-      
-      - name: Close stale issues
-        run: |
-          # Find issues stale > 7 days
-          # Close them
-```
-
-**Marketplace solution**: **Stale action**
-
-```yaml
-name: Close Stale Issues
-
-on:
-  schedule:
-    - cron: '0 0 * * *'
-
-jobs:
-  stale:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/stale@v8
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          stale-issue-message: 'This issue is stale because it has been open 30 days with no activity. Remove stale label or comment or this will be closed in 7 days.'
-          stale-pr-message: 'This PR is stale because it has been open 30 days with no activity.'
-          close-issue-message: 'This issue was closed because it has been stalled for 7 days with no activity.'
-          days-before-stale: 30
-          days-before-close: 7
-          stale-issue-label: 'stale'
-          stale-pr-label: 'stale'
-```
-
-**Configuration options**:
-- `days-before-stale` - Inactivity threshold
-- `days-before-close` - Grace period after stale label
-- Custom messages for issues/PRs
-- Exempt labels (e.g., "pinned" issues never go stale)
-
-## Repository Automation: Dependency Updates
-
-**Goal**: Automatically update dependencies to latest versions.
-
-**Reasons**:
-- **Security patches** - Critical vulnerabilities fixed in newer versions
-- **New features** - Benefit from improvements
-- **Compatibility** - Stay current with ecosystem
-
-**Baseline implementation**:
-```yaml
-name: Update Dependencies
-
-on:
-  schedule:
-    - cron: '0 0 * * 1'  # Weekly on Monday
-
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Check for updates
-        run: |
-          # Read package-lock.json
-          # Query registry for newer versions
-          npm outdated
-      
-      - name: Update dependencies
-        run: |
-          npm update
-      
-      - name: Create PR
-        run: |
-          git checkout -b update-dependencies-$(date +%Y%m%d)
-          git add package.json package-lock.json
-          git commit -m "chore: update dependencies"
-          git push origin update-dependencies-$(date +%Y%m%d)
-          # Use GitHub API to create PR
-```
-
-**Marketplace/service solution**: **Dependabot** (built into GitHub)
-
-**Setup**: Create `.github/dependabot.yml`
-
-```yaml
-version: 2
-updates:
-  - package-ecosystem: "npm"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
-    
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-  
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-```
-
-**What Dependabot does**:
-- Monitors dependencies (npm, pip, Maven, Docker, GitHub Actions, etc.)
-- Creates PR for each update
-- Includes changelog and compatibility notes
-- Triggers your test workflow automatically
-- Closes PR if tests fail
-
-**Result**: Dependency updates become automatic, reviewable, testable PRs.
-
-## GitHub's Template Workflows
-
-**Location**: Actions tab → "New workflow" button
-
-**What they are**: Pre-built workflow templates for common scenarios.
-
-**Categories**:
-- **Deployment** - AWS ECS, Azure, Google Cloud, Kubernetes
-- **Continuous Integration** - Node.js, Python, Go, Java, .NET
-- **Security** - CodeQL analysis, dependency scanning
-- **Automation** - Stale issues, greeting new contributors
-
-**How to use**:
-1. Navigate to Actions tab in repository
-2. Click "New workflow"
-3. Browse suggested workflows (GitHub suggests based on repository languages)
-4. Click "Configure" on relevant template
-5. Customize and commit
-
-### Example: Docker Image Template
-
-```yaml
-name: Docker Image CI
-
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag my-image-name:$(date +%s)
-```
-
-**What this provides**:
-- Basic structure
-- Trigger events
-- Build command
-
-**What you'd add**:
-- Push to registry
-- Multi-stage builds
-- Caching
-- Tagging strategy
-
-### Example: AWS ECS Deployment Template
-
-**Before using**, you must:
-1. Create ECR repository
-2. Create ECS task definition (store in repo as `task-definition.json`)
-3. Configure IAM permissions for workflow
-
-**Workflow structure**:
-```yaml
-name: Deploy to Amazon ECS
-
-on:
-  push:
-    branches: [ "main" ]
-
-env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: my-app
-  ECS_SERVICE: my-service
-  ECS_CLUSTER: my-cluster
-  CONTAINER_NAME: my-app
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-      
-      - name: Build, tag, and push image to Amazon ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-      
-      - name: Fill in the new image ID in the Amazon ECS task definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image }}
-      
-      - name: Deploy Amazon ECS task definition
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
-```
-
-**Improvements to make**:
-- **Change authentication** - Use OIDC instead of static keys
-- **Add build caching** - Speed up Docker builds
-- **Add rollback** - On validation failure
-- **Add smoke tests** - Validate deployment health
-
-## Key Workflow Design Principles
-
-**1. Start simple, optimize later**
-- Get baseline working first
-- Measure performance before optimizing
-- Don't prematurely optimize
-
-**2. Leverage marketplace actions**
-- Don't reinvent the wheel
-- Use well-maintained, popular actions
-- Pin to commit SHAs for security
-
-**3. Make workflows observable**
-- Upload artifacts (test results, build outputs)
-- Use annotations for errors/warnings
-- Set meaningful job names and step names
-
-**4. Design for failure**
-- Use `if: always()` to ensure cleanup steps run
-- Add validation steps after deployments
-- Include rollback procedures
-
-**5. Optimize for speed**
-- Enable caching (dependencies, build outputs)
-- Run jobs in parallel where possible
-- Only run on relevant file changes (path filters)
-
-**6. Keep workflows DRY**
-- Use reusable workflows for repeated logic
-- Create composite actions for step sequences
-- Use matrix strategies for similar jobs
-
-## Summary: Workflow Patterns
-
-| Workflow Type | Key Steps | Common Tools |
-|--------------|-----------|--------------|
-| **Linting** | Checkout → Detect changes → Run linters → Report | Super-Linter, ESLint, Pylint |
-| **Testing** | Checkout → Setup toolchain → Install deps → Build → Test → Upload results | setup-node/python/go, Jest, pytest |
-| **Static Analysis** | Checkout → Install tool → Scan → Report | CodeQL, Snyk, Trivy |
-| **Build Executable** | Checkout → Setup toolchain → Install deps → Build → Publish | setup-node/go/rust, npm/cargo |
-| **Build Image** | Checkout → Setup Docker → Build → Push | docker/build-push-action |
-| **Deploy (Push)** | Checkout configs → Authenticate → Deploy → Validate | AWS/Azure/GCP actions |
-| **Deploy (GitOps)** | Checkout manifest repo → Update version → Commit → Push | git commands |
-| **Release** | Parse commits → Bump version → Update changelog → Create release | Release Please |
-| **Stale Issues** | Fetch issues → Mark stale → Close old | Stale action |
-| **Dependencies** | Check for updates → Create PR → Run tests | Dependabot |
-
-## Next Chapter
-
-You've learned how to design and build real-world workflows for common CI/CD scenarios. In Chapter 10, we'll explore **Developer Experience**—the tools and techniques for debugging workflows, testing actions locally, and iterating quickly. Great workflows aren't just functional; they're also easy to develop and maintain. You'll learn how to optimize your development loop to build better automation faster.
+- Original notes: `git show master:09_common_workflows.md`. Corrections: injection-prone kubeconfig interpolation, the false claim that Dependabot closes failing PRs, archived `actions/create-release`, outdated `release-please` reference and `actions/stale@v8`, outdated artifact/cache versions. Starter-template walkthroughs (Docker, ECS) were condensed into Lesson 9.8 because they duplicate GitHub's own templates, which change often.
+- Official docs: [Workflow syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax) · [Authenticate with GITHUB_TOKEN](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token) · [Reusable workflows](https://docs.github.com/en/actions/reference/workflows-and-actions/reusable-workflows)
+- Not verified here: archived status of `actions/create-release` and current major version of `googleapis/release-please-action` (from knowledge; confirm on the repositories).
